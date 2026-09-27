@@ -1,0 +1,21 @@
+# Operating-system and editor metadata
+.DS_Store
+.idea/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Django local state
+db.sqlite3
+
+# Model Weights
+*.h5
+*.pt
