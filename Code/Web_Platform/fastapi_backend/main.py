@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import ALLOWED_ORIGINS
-from routers import dicom, predict
+from routers import upload, localizer, segment, convert
 
 app = FastAPI(
     title="Myocardial Viability Assessment API",
@@ -20,8 +20,10 @@ app.add_middleware(
 )
 
 # Register routers
-app.include_router(dicom.router)
-app.include_router(predict.router)
+app.include_router(upload.router)
+app.include_router(localizer.router)
+app.include_router(segment.router)
+app.include_router(convert.router)
 
 
 @app.get("/", tags=["Health"])

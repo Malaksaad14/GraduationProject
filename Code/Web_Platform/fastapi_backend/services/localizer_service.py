@@ -82,3 +82,59 @@ def run_localizer(input_array: np.ndarray, weights_path: str) -> np.ndarray:
         
     cropped_roi = postprocess_segmentation(seg, input_array, resized_shape)
     return cropped_roi
+
+
+def run_localizer_3d(volume_array: np.ndarray, weights_path: str) -> np.ndarray:
+    """
+    Takes a 3D volume (H, W, D).
+    Runs the localizer on the middle slice to find the center.
+    Crops all slices to 128x128 around that center.
+    """
+    model = get_localizer_model(weights_path)
+    
+    # Get middle slice
+    mid_idx = volume_array.shape[2] // 2
+    mid_slice = volume_array[:, :, mid_idx]
+    
+    input_tensor, resized_shape = preprocess_image(mid_slice)
+    
+    with torch.no_grad():
+        pred = model(input_tensor)
+        pred = torch.softmax(pred[0], dim=0)
+        seg = torch.argmax(pred, dim=0).cpu().numpy()
+        
+    # Find bounding box based on the middle slice segmentation
+    lv_segmentation = seg.copy()
+    lv_segmentation[(lv_segmentation != 1) & (lv_segmentation != 2)] = 0
+    roi_mask = (lv_segmentation == 1) | (lv_segmentation == 2)
+    labeled_array, num_features = label(roi_mask)
+
+    largest_component = None
+    max_size = 0
+    for i in range(1, num_features + 1):
+        component_size = np.sum(labeled_array == i)
+        if component_size > max_size:
+            max_size = component_size
+            largest_component = (labeled_array == i)
+
+    if largest_component is None:
+        raise ValueError("No valid ROI found. Model could not find the heart.")
+
+    roi_coords = np.argwhere(largest_component)
+    center_y, center_x = roi_coords.mean(axis=0)
+
+    scale_y = mid_slice.shape[0] / resized_shape[0]
+    scale_x = mid_slice.shape[1] / resized_shape[1]
+    center_y_original = center_y * scale_y
+    center_x_original = center_x * scale_x
+
+    roi_height, roi_width = 128, 128
+    top_left_y = max(0, int(center_y_original - roi_height / 2))
+    top_left_x = max(0, int(center_x_original - roi_width / 2))
+    bottom_right_y = min(mid_slice.shape[0], int(center_y_original + roi_height / 2))
+    bottom_right_x = min(mid_slice.shape[1], int(center_x_original + roi_width / 2))
+
+    # Crop the whole 3D volume using the coordinates from the middle slice
+    cropped_volume = volume_array[top_left_y:bottom_right_y, top_left_x:bottom_right_x, :]
+    return cropped_volume
+
