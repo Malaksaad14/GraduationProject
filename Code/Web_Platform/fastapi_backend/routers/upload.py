@@ -1,6 +1,7 @@
 import io
 import uuid
 import nibabel as nib
+import gzip
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from services.dicom_service import read_dicom_from_bytes, get_pixel_array, save_dicom_file
 from config import UPLOAD_DIR
@@ -8,6 +9,7 @@ from config import UPLOAD_DIR
 router = APIRouter(prefix="/upload", tags=["Upload"])
 
 @router.post("/dicom", summary="Upload a DICOM file and get its metadata")
+@router.post("-dicom/", include_in_schema=False)
 async def upload_dicom(dicom_file: UploadFile = File(...)):
     filename = dicom_file.filename.lower()
     if not (filename.endswith(".dcm") or filename.endswith(".dicom")):
@@ -43,23 +45,28 @@ async def upload_nifti(nifti_file: UploadFile = File(...)):
     if not (filename.endswith(".nii") or filename.endswith(".nii.gz")):
         raise HTTPException(status_code=400, detail="File must be .nii or .nii.gz")
     file_bytes = await nifti_file.read()
-    try:
-        file_obj = io.BytesIO(file_bytes)
-        fh = nib.FileHolder(fileobj=file_obj)
-        nifti_img = nib.Nifti1Image.from_file_map({"header": fh, "image": fh})
-        header = nifti_img.header
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid NIfTI file: {str(e)}")
     unique_id = uuid.uuid4().hex
     ext = ".nii.gz" if filename.endswith(".nii.gz") else ".nii"
-    with open(UPLOAD_DIR / f"{unique_id}{ext}", "wb") as f:
+    saved_path = UPLOAD_DIR / f"{unique_id}{ext}"
+    with open(saved_path, "wb") as f:
         f.write(file_bytes)
+    try:
+        nifti_img = nib.load(str(saved_path))
+        header = nifti_img.header
+        shape = header.get_data_shape()
+        zooms = header.get_zooms()
+        dtype = str(header.get_data_dtype())
+    except Exception as e:
+        if saved_path.exists():
+            saved_path.unlink()
+        raise HTTPException(status_code=400, detail=f"Invalid NIfTI file: {str(e)}")
     return {
         "message": "NIfTI uploaded successfully",
         "filename": nifti_file.filename,
         "metadata": {
-            "Dimensions": str(header.get_data_shape()),
-            "VoxelSizes": str(header.get_zooms()),
-            "DataType": str(header.get_data_dtype()),
+            "Dimensions": str(shape),
+            "VoxelSizes": str(zooms),
+            "DataType": dtype,
         }
     }
+

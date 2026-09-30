@@ -17,6 +17,7 @@
     "fabric": "^6.5.3",
     "hammerjs": "^2.0.8",
     "lucide-react": "^0.474.0",
+    "nifti-reader-js": "^0.8.0",
     "react": "^17.0.2",
     "react-cornerstone-viewport": "^4.1.5",
     "react-dom": "^17.0.2",

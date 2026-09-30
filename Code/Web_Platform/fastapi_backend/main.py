@@ -25,6 +25,13 @@ app.include_router(localizer.router)
 app.include_router(segment.router)
 app.include_router(convert.router)
 
+# Also register with /api prefix for compatibility
+app.include_router(upload.router, prefix="/api")
+app.include_router(localizer.router, prefix="/api")
+app.include_router(segment.router, prefix="/api")
+app.include_router(convert.router, prefix="/api")
+
+
 
 @app.get("/", tags=["Health"])
 def root():

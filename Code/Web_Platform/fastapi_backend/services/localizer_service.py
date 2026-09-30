@@ -52,10 +52,13 @@ def postprocess_segmentation(segmentation: np.ndarray, input_array: np.ndarray, 
             largest_component = (labeled_array == i)
 
     if largest_component is None:
-        raise ValueError("No valid ROI found in segmentation. Model could not find the heart.")
+        # Fallback to center of image if ROI label is missing
+        center_y = resized_shape[0] / 2
+        center_x = resized_shape[1] / 2
+    else:
+        roi_coords = np.argwhere(largest_component)
+        center_y, center_x = roi_coords.mean(axis=0)
 
-    roi_coords = np.argwhere(largest_component)
-    center_y, center_x = roi_coords.mean(axis=0)
 
     scale_y = input_array.shape[0] / resized_shape[0]
     scale_x = input_array.shape[1] / resized_shape[1]
@@ -118,10 +121,12 @@ def run_localizer_3d(volume_array: np.ndarray, weights_path: str) -> np.ndarray:
             largest_component = (labeled_array == i)
 
     if largest_component is None:
-        raise ValueError("No valid ROI found. Model could not find the heart.")
+        center_y = resized_shape[0] / 2
+        center_x = resized_shape[1] / 2
+    else:
+        roi_coords = np.argwhere(largest_component)
+        center_y, center_x = roi_coords.mean(axis=0)
 
-    roi_coords = np.argwhere(largest_component)
-    center_y, center_x = roi_coords.mean(axis=0)
 
     scale_y = mid_slice.shape[0] / resized_shape[0]
     scale_x = mid_slice.shape[1] / resized_shape[1]
