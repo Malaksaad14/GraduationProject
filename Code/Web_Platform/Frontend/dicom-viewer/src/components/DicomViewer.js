@@ -688,8 +688,14 @@ function DicomViewer() {
 
     useEffect(() => {
         if (uploadedFiles.length > 0) {
-            console.log(`Loading image ${currentFileIndex} in main viewer`);
-            loadDicomImage(uploadedFiles[currentFileIndex]); // Main viewer
+            const file = uploadedFiles[currentFileIndex];
+            const isNifti = file && (file.name.endsWith('.nii') || file.name.endsWith('.nii.gz'));
+            
+            // lw l file Dicom bs yshtghl bl tare2a de
+            if (!isNifti) {
+                console.log(`Loading image ${currentFileIndex} in main viewer`);
+                loadDicomImage(file);
+            }
         }
     }, [currentFileIndex, uploadedFiles]);
 
@@ -822,7 +828,7 @@ function DicomViewer() {
             formData.append('dicom_file', file);
 
             try {
-                const response = await fetch('http://127.0.0.1:8000/api/upload-dicom/', {
+                const response = await fetch('http://127.0.0.1:8000/upload/dicom', {
                     method: 'POST',
                     body: formData,
                 });
@@ -873,7 +879,7 @@ function DicomViewer() {
             const formData = new FormData();
             formData.append('dicom_file', file);
 
-            const response = await fetch('http://127.0.0.1:8000/api/extract-metadata/', {
+            const response = await fetch('http://127.0.0.1:8000/upload/dicom', {
                 method: 'POST',
                 body: formData,
             });
@@ -996,7 +1002,7 @@ function DicomViewer() {
         const formData = new FormData();
         formData.append('dicom_file', file);  // Appends the DICOM file to the form data under the key 'dicom_file'
 
-        fetch('http://127.0.0.1:8000/api/upload-dicom/', {
+        fetch('http://127.0.0.1:8000/upload/dicom', {
             method: 'POST',
             body: formData,
         })
@@ -1096,7 +1102,7 @@ function DicomViewer() {
             formData.append('original_dicom_path', `uploads/${uploadedFiles[currentFileIndex].name}`);
             formData.append('modified_pixel_data', new Blob([pixelData.buffer], {type: 'application/octet-stream'}), 'pixel_data.raw');
 
-            fetch('http://127.0.0.1:8000/api/save-processed-dicom/', {
+            fetch('http://127.0.0.1:8000/convert/dicom-to-nifti', {
                 method: 'POST',
                 body: formData,
             })
@@ -1126,10 +1132,25 @@ function DicomViewer() {
                     const errDetail = await response.text();
                     throw new Error(`Localizer failed (${response.status}): ${errDetail}`);
                 }
-                const arrayBuffer = await response.arrayBuffer();
-                // Replace main viewer image with localized NIfTI output
-                await parseAndDisplayNiftiBuffer(arrayBuffer, dicomImageRef.current, setMetadata, false);
-                setIsProcessedDicomVisible(false);
+                const data = await response.json();
+                
+                // Show the processed viewer panel
+                setIsProcessedDicomVisible(true);
+
+                if (data.nifti_file_data) {
+                    console.log("Processed NIfTI file received!");
+                    
+                    // Decode base64 to ArrayBuffer
+                    const binaryString = atob(data.nifti_file_data);
+                    const len = binaryString.length;
+                    const bytes = new Uint8Array(len);
+                    for (let i = 0; i < len; i++) {
+                        bytes[i] = binaryString.charCodeAt(i);
+                    }
+                    
+                    // Display NIfTI in processed viewer
+                    await parseAndDisplayNiftiBuffer(bytes.buffer, processedDicomRef.current, setProcessedMetadata, true);
+                }
             } catch (error) {
                 console.error("Error sending NIfTI to localizer:", error);
                 alert("Error running localizer on NIfTI file: " + error.message);
@@ -1139,27 +1160,31 @@ function DicomViewer() {
             formData.append('dicom_file', file);
 
             try {
-                const response = await fetch('http://127.0.0.1:8000/api/send-to-localizer/', {
+                // Notice the URL is updated to the clean localizer/dicom route
+                const response = await fetch('http://127.0.0.1:8000/localizer/dicom', {
                     method: 'POST',
                     body: formData,
                 });
                 const data = await response.json();
+                
+                // Show the processed viewer panel
+                setIsProcessedDicomVisible(true);
 
                 if (data.dicom_file_data) {
                     console.log("Processed DICOM file received!");
                     const byteArray = new Uint8Array(atob(data.dicom_file_data).split("").map(char => char.charCodeAt(0)));
                     const dicomBlob = new Blob([byteArray], {type: 'application/dicom'});
                     const procMetadata = await fetchMetadata(dicomBlob);
-                    setMetadata(procMetadata);
+                    setProcessedMetadata(procMetadata);
 
-                    if (dicomImageRef.current) {
-                        cornerstone.enable(dicomImageRef.current);
+                    // Show in the processedDicomRef, NOT dicomImageRef
+                    if (processedDicomRef.current) {
+                        cornerstone.enable(processedDicomRef.current);
                         const imageId = cornerstoneWADOImageLoader.wadouri.fileManager.add(dicomBlob);
                         cornerstone.loadImage(imageId).then(image => {
-                            cornerstone.displayImage(dicomImageRef.current, image);
+                            cornerstone.displayImage(processedDicomRef.current, image);
                         }).catch(err => console.error(err));
                     }
-                    setIsProcessedDicomVisible(false);
                 } else if (data.error) {
                     console.error("Error:", data.error);
                 }
@@ -1170,14 +1195,13 @@ function DicomViewer() {
     }
 
 
-
     // Function to extract metadata for the processed DICOM
     async function fetchMetadata(dicomBlob) {
         const formData = new FormData();
         formData.append('dicom_file', dicomBlob);
 
         try {
-            const response = await fetch('http://127.0.0.1:8000/api/extract-metadata/', {
+            const response = await fetch('http://127.0.0.1:8000/extract-metadata/', {
                 method: 'POST',
                 body: formData,
             });
@@ -1436,7 +1460,7 @@ function DicomViewer() {
         console.log("Sending DICOM to nnU-Net model...");
 
         try {
-            const response = await fetch('http://127.0.0.1:8000/api/predict-dicom/', {
+            const response = await fetch('http://127.0.0.1:8000/segment/dicom', {
                 method: 'POST',
                 body: formData,
             });

@@ -1,10 +1,14 @@
 import io
+import pydicom
 import uuid
 import nibabel as nib
 import gzip
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from services.dicom_service import read_dicom_from_bytes, get_pixel_array, save_dicom_file
+
 from config import UPLOAD_DIR
+from fastapi.responses import JSONResponse
+
 
 router = APIRouter(prefix="/upload", tags=["Upload"])
 
@@ -70,3 +74,26 @@ async def upload_nifti(nifti_file: UploadFile = File(...)):
         }
     }
 
+@router.post("/extract-metadata", summary="Extract metadata from a DICOM file")
+async def extract_metadata(dicom_file: UploadFile = File(...)):
+    if not dicom_file.filename.lower().endswith(".dcm"):
+        raise HTTPException(status_code=400, detail="File must be .dcm")
+    
+    file_bytes = await dicom_file.read()
+    try:
+        ds = pydicom.dcmread(io.BytesIO(file_bytes))
+        
+      
+        metadata = {}
+        for elem in ds:
+        
+            if elem.name != 'Pixel Data':
+                tag_str = f"({elem.tag.group:04X}, {elem.tag.element:04X})"
+                metadata[tag_str] = {
+                    "name": elem.name,
+                    "value": str(elem.value)
+                }
+                
+        return JSONResponse(content=metadata)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to extract metadata: {str(e)}")

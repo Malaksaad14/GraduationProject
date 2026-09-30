@@ -55,29 +55,33 @@ async def localize_nifti(nifti_file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="File must be .nii or .nii.gz")
     if not WEIGHTS_PATH.exists():
         raise HTTPException(status_code=503, detail="Localizer model weights not found at weights/model.pt")
+    
     file_bytes = await nifti_file.read()
     unique_id = uuid.uuid4().hex
     ext = ".nii.gz" if filename.endswith(".nii.gz") else ".nii"
-    temp_input_path = UPLOAD_DIR / f"temp_{unique_id}{ext}"
     out_path = OUTPUT_DIR / f"localized_{unique_id}{ext}"
     
-    with open(temp_input_path, "wb") as f:
-        f.write(file_bytes)
-        
     try:
-        nifti_img = nib.load(str(temp_input_path))
+        file_obj = io.BytesIO(file_bytes)
+        fh = nib.FileHolder(fileobj=file_obj)
+        nifti_img = nib.Nifti1Image.from_file_map({"header": fh, "image": fh})
         data = nifti_img.get_fdata().astype(np.float32)
         if data.ndim != 3:
-            raise ValueError(f"Expected a 3D NIfTI volume, got shape {data.shape}")
+            raise ValueError("Expected a 3D NIfTI volume.")
+            
         cropped = run_localizer_3d(data, str(WEIGHTS_PATH))
-        out_nii = nib.Nifti1Image(cropped, nifti_img.affine, nifti_img.header)
-        nib.save(out_nii, str(out_path))
+        nib.save(nib.Nifti1Image(cropped, nifti_img.affine, nifti_img.header), str(out_path))
+        
+        # تحويل ملف الـ NIfTI المقصوص لـ Base64 عشان يرجع للـ Frontend
+        with open(out_path, "rb") as f:
+            nifti_b64 = base64.b64encode(f.read()).decode("utf-8")
+            
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Localization failed: {str(e)}")
-    finally:
-        if temp_input_path.exists():
-            temp_input_path.unlink()
-            
-    return FileResponse(path=str(out_path), media_type="application/gzip",
-                        filename=f"localized_{nifti_file.filename}")
+        
+    return JSONResponse(content={
+        "message": "Localization complete",
+        "filename": nifti_file.filename,
+        "nifti_file_data": nifti_b64,
+    })
 
