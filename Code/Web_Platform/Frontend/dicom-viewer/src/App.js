@@ -1,10 +1,10 @@
 import React from 'react';
-import DicomViewer from "./components/DicomViewer";
+import MedicalViewer from './components/MedicalViewer';
 
 function App() {
     return (
-        <div>
-            <DicomViewer/>
+        <div className="w-full h-screen bg-[#0a0e14]">
+            <MedicalViewer />
         </div>
     );
 }

@@ -18,6 +18,12 @@ TASK_NAME = os.getenv("NNUNET_TASK", "Dataset033_EMDIC")
 
 # CORS settings
 ALLOWED_ORIGINS = [
-    "http://localhost:3000",  # React frontend
-    "http://localhost:5173",  # Vite frontend
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:3002",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://127.0.0.1:3002",
+    "http://127.0.0.1:5173",
 ]

@@ -1,11 +1,22 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
+import {
+    uploadDicom,
+    extractDicomMetadata,
+    sendToLocalizer,
+    predictDicom,
+    uploadNifti,
+    predictNifti,
+    niftiToDicom,
+    downloadDicomSeries,
+    healthCheck,
+} from '../api';
 import * as cornerstone from 'cornerstone-core';
 import * as cornerstoneWADOImageLoader from 'cornerstone-wado-image-loader';
 import * as dicomParser from 'dicom-parser';
 import * as cornerstoneTools from 'cornerstone-tools';
 import * as cornerstoneMath from 'cornerstone-math';
 import Hammer from 'hammerjs';
-import * as nifti from 'nifti-reader-js';
+import JSZip from 'jszip';
 
 
 // import { Move } from 'lucide-react';
@@ -74,117 +85,10 @@ function DicomViewer() {
     const [processedCurrentIndex, setProcessedCurrentIndex] = useState(0);
     const [processedGroupedSeries, setProcessedGroupedSeries] = useState({});
 
+    // nav bar
     const [showUploadDropdown, setShowUploadDropdown] = useState(false);
     const [showSettingsDropdown, setShowSettingsDropdown] = useState(false);
     const isDisabled = uploadedFiles.length === 0;
-
-    // NIfTI state variables
-    const [niftiVolume, setNiftiVolume] = useState(null);
-    const [niftiSliceIndex, setNiftiSliceIndex] = useState(0);
-    const [processedNiftiVolume, setProcessedNiftiVolume] = useState(null);
-    const [processedNiftiSliceIndex, setProcessedNiftiSliceIndex] = useState(0);
-
-    function displayNiftiSlice(volObj, sliceIndex, targetElement) {
-        if (!volObj || !targetElement) return;
-        const { dimX, dimY, dimZ, typedData, header } = volObj;
-        const s = Math.max(0, Math.min(sliceIndex, dimZ - 1));
-        const sliceSize = dimX * dimY;
-        const sliceOffset = s * sliceSize;
-        const slicePixels = typedData.subarray(sliceOffset, sliceOffset + sliceSize);
-
-        let min = Infinity, max = -Infinity;
-        const pixelData = new Int16Array(sliceSize);
-        for (let i = 0; i < sliceSize; i++) {
-            const v = slicePixels[i];
-            if (v < min) min = v;
-            if (v > max) max = v;
-            pixelData[i] = v;
-        }
-
-        const windowWidth = (max - min) || 1;
-        const windowCenter = (max + min) / 2;
-
-        const cornerstoneImage = {
-            imageId: `nifti:${s}:${Date.now()}`,
-            minPixelValue: min,
-            maxPixelValue: max,
-            slope: 1,
-            intercept: 0,
-            windowCenter: windowCenter,
-            windowWidth: windowWidth,
-            getPixelData: () => pixelData,
-            rows: dimY,
-            columns: dimX,
-            height: dimY,
-            width: dimX,
-            color: false,
-            columnPixelSpacing: (header && header.pixDims && header.pixDims[1]) ? header.pixDims[1] : 1,
-            rowPixelSpacing: (header && header.pixDims && header.pixDims[2]) ? header.pixDims[2] : 1,
-            sizeInBytes: sliceSize * 2,
-        };
-
-        if (!cornerstone.getEnabledElements().some(el => el.element === targetElement)) {
-            cornerstone.enable(targetElement);
-        }
-        cornerstone.displayImage(targetElement, cornerstoneImage);
-    }
-
-    async function parseAndDisplayNiftiBuffer(arrayBuffer, targetElement, setMetadataFunc, isProcessed = false) {
-        if (!targetElement) return;
-        let buffer = arrayBuffer;
-        if (nifti.isCompressed(buffer)) {
-            buffer = nifti.decompress(buffer);
-        }
-        if (!nifti.isNIFTI(buffer)) {
-            alert("Uploaded file is not a valid NIfTI format.");
-            return;
-        }
-
-        const header = nifti.readHeader(buffer);
-        const imageBuffer = nifti.readImage(header, buffer);
-
-        const dimX = header.dims[1];
-        const dimY = header.dims[2];
-        const dimZ = header.dims[3] || 1;
-
-        let typedData;
-        switch (header.datatypeCode) {
-            case nifti.NIFTI1.TYPE_INT8: typedData = new Int8Array(imageBuffer); break;
-            case nifti.NIFTI1.TYPE_INT16: typedData = new Int16Array(imageBuffer); break;
-            case nifti.NIFTI1.TYPE_INT32: typedData = new Int32Array(imageBuffer); break;
-            case nifti.NIFTI1.TYPE_FLOAT32: typedData = new Float32Array(imageBuffer); break;
-            case nifti.NIFTI1.TYPE_FLOAT64: typedData = new Float64Array(imageBuffer); break;
-            case nifti.NIFTI1.TYPE_UINT8: typedData = new Uint8Array(imageBuffer); break;
-            case nifti.NIFTI1.TYPE_UINT16: typedData = new Uint16Array(imageBuffer); break;
-            case nifti.NIFTI1.TYPE_UINT32: typedData = new Uint32Array(imageBuffer); break;
-            default: typedData = new Float32Array(imageBuffer); break;
-        }
-
-        const volObj = { header, dimX, dimY, dimZ, typedData, buffer };
-        const midSlice = Math.floor(dimZ / 2);
-
-        if (isProcessed) {
-            setProcessedNiftiVolume(volObj);
-            setProcessedNiftiSliceIndex(midSlice);
-            displayNiftiSlice(volObj, midSlice, targetElement);
-        } else {
-            setNiftiVolume(volObj);
-            setNiftiSliceIndex(midSlice);
-            displayNiftiSlice(volObj, midSlice, targetElement);
-        }
-
-        const niftiMeta = {
-            "Dimensions": `${dimX} x ${dimY} x ${dimZ}`,
-            "Voxel Sizes": (header && header.pixDims) ? header.pixDims.slice(1, 4).map(v => Number(v).toFixed(2)).join(" x ") : "N/A",
-            "Data Type": header.datatypeCode,
-            "Total Slices": String(dimZ),
-            "Current Slice": String(midSlice + 1),
-            "Modality": "NIfTI MRI/CT"
-        };
-        if (setMetadataFunc) {
-            setMetadataFunc(niftiMeta);
-        }
-    }
 
     // split screens
     const [isSplitView, setIsSplitView] = useState(false);
@@ -226,6 +130,18 @@ function DicomViewer() {
     const [segmentationMetadata, setSegmentationMetadata] = useState(null);
     const segmentationDicomRef = useRef(null);
 
+    // ── NIfTI workflow state ──────────────────────────────────────────────────
+    const [niftiFile, setNiftiFile] = useState(null);           // uploaded NIfTI File object
+    const [niftiMetadata, setNiftiMetadata] = useState(null);   // metadata returned by /nifti/upload
+    const [niftiSessionId, setNiftiSessionId] = useState(null); // session id from upload
+    const [isNiftiPanelOpen, setIsNiftiPanelOpen] = useState(false);
+    const [isNiftiProcessing, setIsNiftiProcessing] = useState(false);
+    const [niftiStatusMsg, setNiftiStatusMsg] = useState('');
+    const [niftiConvertSessionId, setNiftiConvertSessionId] = useState(null); // session id from nifti-to-dicom
+
+    // ── Backend health state ──────────────────────────────────────────────────
+    const [backendOnline, setBackendOnline] = useState(null); // null = checking, true = ok, false = down
+
 
 
     // name: Internal name of the tool, used by cornerstone-tools.
@@ -241,6 +157,146 @@ function DicomViewer() {
         // { name: "FreehandRoi", label: "Polyline", icon: SquareDashedMousePointer }, // Add Polyline Tool
 
     ];
+
+    // ── Backend health check on mount ─────────────────────────────────────
+    useEffect(() => {
+        healthCheck()
+            .then(() => setBackendOnline(true))
+            .catch(() => setBackendOnline(false));
+    }, []);
+
+    // ── NIfTI → View in Viewer ────────────────────────────────────────────────
+    const handleLoadNiftiToViewer = async (fileToLoad = null) => {
+        const file = fileToLoad || niftiFile;
+        if (!file) return;
+        setIsNiftiProcessing(true);
+        setNiftiStatusMsg('Converting NIfTI volume to DICOM slices for viewing…');
+        try {
+            const response = await niftiToDicom(file);
+            const sessionId = response.headers.get('X-Session-Id');
+            if (sessionId) setNiftiConvertSessionId(sessionId);
+
+            const zipBlob = await response.blob();
+            const zip = await JSZip.loadAsync(zipBlob);
+
+            const dicomFiles = [];
+            const sortedFileNames = Object.keys(zip.files).sort();
+
+            for (const fileName of sortedFileNames) {
+                if (fileName.endsWith('.dcm') && !zip.files[fileName].dir) {
+                    const fileData = await zip.files[fileName].async('arraybuffer');
+                    const dicomFile = new File([fileData], fileName, { type: 'application/dicom' });
+                    dicomFiles.push(dicomFile);
+                }
+            }
+
+            if (dicomFiles.length > 0) {
+                setUploadedFiles(dicomFiles);
+                setCurrentFileIndex(0);
+                await extractMetadataForFiles(dicomFiles);
+                setNiftiStatusMsg(`Successfully loaded ${dicomFiles.length} DICOM slices into viewer!`);
+            } else {
+                setNiftiStatusMsg('No DICOM slices found in converted package.');
+            }
+        } catch (err) {
+            console.error('Error loading NIfTI slices:', err);
+            setNiftiStatusMsg(`Error loading NIfTI slices: ${err.message}`);
+        } finally {
+            setIsNiftiProcessing(false);
+        }
+    };
+
+    // ── NIfTI upload handler ──────────────────────────────────────────────────
+    const handleNiftiFileChange = async (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+        if (!file.name.toLowerCase().endsWith('.nii') && !file.name.toLowerCase().endsWith('.nii.gz')) {
+            alert('Please select a valid .nii or .nii.gz file.');
+            return;
+        }
+        setNiftiFile(file);
+        setNiftiMetadata(null);
+        setNiftiStatusMsg('Uploading NIfTI & extracting metadata…');
+        setIsNiftiPanelOpen(true);
+        try {
+            const result = await uploadNifti(file);
+            setNiftiMetadata(result.metadata);
+            setNiftiSessionId(result.session_id);
+            setNiftiStatusMsg(`Uploaded: ${result.filename}. Rendering slices in viewer…`);
+            await handleLoadNiftiToViewer(file);
+        } catch (err) {
+            setNiftiStatusMsg(`Upload failed: ${err.message}`);
+        }
+    };
+
+    // ── NIfTI predict (segmentation) ─────────────────────────────────────────
+    const handleNiftiPredict = async () => {
+        if (!niftiFile) return;
+        setIsNiftiProcessing(true);
+        setNiftiStatusMsg('Running NIfTI segmentation…');
+        try {
+            const response = await predictNifti(niftiFile);
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            // Trigger browser download
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'predicted_segmentation.nii.gz';
+            a.click();
+            URL.revokeObjectURL(url);
+            setNiftiStatusMsg('Segmentation complete — file downloaded.');
+        } catch (err) {
+            setNiftiStatusMsg(`Prediction failed: ${err.message}`);
+        } finally {
+            setIsNiftiProcessing(false);
+        }
+    };
+
+    // ── NIfTI → DICOM conversion ──────────────────────────────────────────────
+    const handleNiftiToDicom = async () => {
+        if (!niftiFile) return;
+        setIsNiftiProcessing(true);
+        setNiftiStatusMsg('Converting NIfTI → DICOM series…');
+        try {
+            const response = await niftiToDicom(niftiFile);
+            const sessionId = response.headers.get('X-Session-Id');
+            setNiftiConvertSessionId(sessionId);
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `dicom_series${sessionId ? '_' + sessionId : ''}.zip`;
+            a.click();
+            URL.revokeObjectURL(url);
+            setNiftiStatusMsg(`Conversion complete — DICOM zip downloaded.${sessionId ? ' Session: ' + sessionId.slice(0, 8) + '…' : ''}`);
+        } catch (err) {
+            setNiftiStatusMsg(`Conversion failed: ${err.message}`);
+        } finally {
+            setIsNiftiProcessing(false);
+        }
+    };
+
+    // ── Re-download a previously converted DICOM series ───────────────────────
+    const handleRedownloadDicom = async () => {
+        if (!niftiConvertSessionId) return;
+        setIsNiftiProcessing(true);
+        setNiftiStatusMsg('Re-downloading DICOM series…');
+        try {
+            const response = await downloadDicomSeries(niftiConvertSessionId);
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `dicom_series_${niftiConvertSessionId.slice(0, 8)}.zip`;
+            a.click();
+            URL.revokeObjectURL(url);
+            setNiftiStatusMsg('Re-download complete.');
+        } catch (err) {
+            setNiftiStatusMsg(`Download failed: ${err.message}`);
+        } finally {
+            setIsNiftiProcessing(false);
+        }
+    };
 
     // Event listener for mouse movement
     useEffect(() => {
@@ -547,13 +603,6 @@ function DicomViewer() {
     }, [processedDicomRef]); // Only run when the ref is attached
 
     useEffect(() => {
-        if (IsProcessedDicomVisible && processedNiftiVolume && processedDicomRef.current) {
-            displayNiftiSlice(processedNiftiVolume, processedNiftiSliceIndex, processedDicomRef.current);
-        }
-    }, [IsProcessedDicomVisible, processedNiftiVolume, processedNiftiSliceIndex]);
-
-
-    useEffect(() => {
         if (splitScreen1Ref.current) {
             cornerstone.enable(splitScreen1Ref.current); // Enable the second viewer
 
@@ -593,23 +642,25 @@ function DicomViewer() {
 
 
     const handleNextImage = () => {
-        if (niftiVolume) {
-            setNiftiSliceIndex((prev) => {
-                const nextIdx = Math.min(prev + 1, niftiVolume.dimZ - 1);
-                displayNiftiSlice(niftiVolume, nextIdx, dicomImageRef.current);
-                if (metadata) {
-                    setMetadata((m) => ({ ...m, "Current Slice": String(nextIdx + 1) }));
-                }
-                return nextIdx;
-            });
-            return;
-        }
         if (isSynced) {
             console.log("Sync mode: Incrementing all viewers together");
+
+            // if (currentFileIndex < uploadedFiles.length - 1) {
             setCurrentFileIndex(prevIndex => prevIndex + 1);
+            // }
+
+            // if (splitViewer1Index < uploadedFiles.length - 1) {
             setSplitViewer1Index(prevIndex => prevIndex + 1);
+            // }
+
+            // if (splitViewer2Index < uploadedFiles.length - 1) {
             setSplitViewer2Index(prevIndex => prevIndex + 1);
+            // }
+
+            // if (splitViewer3Index < uploadedFiles.length - 1) {
             setSplitViewer3Index(prevIndex => prevIndex + 1);
+            // }
+
         } else {
             if (activeViewer === "main" && currentFileIndex < uploadedFiles.length - 1) {
                 setCurrentFileIndex(prevIndex => prevIndex + 1);
@@ -624,23 +675,25 @@ function DicomViewer() {
     };
 
     const handlePreviousImage = () => {
-        if (niftiVolume) {
-            setNiftiSliceIndex((prev) => {
-                const prevIdx = Math.max(prev - 1, 0);
-                displayNiftiSlice(niftiVolume, prevIdx, dicomImageRef.current);
-                if (metadata) {
-                    setMetadata((m) => ({ ...m, "Current Slice": String(prevIdx + 1) }));
-                }
-                return prevIdx;
-            });
-            return;
-        }
         if (isSynced) {
             console.log("Sync mode: Decrementing all viewers together");
-            if (currentFileIndex > 0) setCurrentFileIndex(prevIndex => prevIndex - 1);
-            if (splitViewer1Index > 0) setSplitViewer1Index(prevIndex => prevIndex - 1);
-            if (splitViewer2Index > 0) setSplitViewer2Index(prevIndex => prevIndex - 1);
-            if (splitViewer3Index > 0) setSplitViewer3Index(prevIndex => prevIndex - 1);
+
+            if (currentFileIndex > 0) {
+                setCurrentFileIndex(prevIndex => prevIndex - 1);
+            }
+
+            if (splitViewer1Index > 0) {
+                setSplitViewer1Index(prevIndex => prevIndex - 1);
+            }
+
+            if (splitViewer2Index > 0) {
+                setSplitViewer2Index(prevIndex => prevIndex - 1);
+            }
+
+            if (splitViewer3Index > 0) {
+                setSplitViewer3Index(prevIndex => prevIndex - 1);
+            }
+
         } else {
             if (activeViewer === "main" && currentFileIndex > 0) {
                 setCurrentFileIndex(prevIndex => prevIndex - 1);
@@ -653,7 +706,6 @@ function DicomViewer() {
             }
         }
     };
-
 
 
 
@@ -688,14 +740,8 @@ function DicomViewer() {
 
     useEffect(() => {
         if (uploadedFiles.length > 0) {
-            const file = uploadedFiles[currentFileIndex];
-            const isNifti = file && (file.name.endsWith('.nii') || file.name.endsWith('.nii.gz'));
-            
-            // lw l file Dicom bs yshtghl bl tare2a de
-            if (!isNifti) {
-                console.log(`Loading image ${currentFileIndex} in main viewer`);
-                loadDicomImage(file);
-            }
+            console.log(`Loading image ${currentFileIndex} in main viewer`);
+            loadDicomImage(uploadedFiles[currentFileIndex]); // Main viewer
         }
     }, [currentFileIndex, uploadedFiles]);
 
@@ -824,15 +870,9 @@ function DicomViewer() {
 
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
-            const formData = new FormData();
-            formData.append('dicom_file', file);
 
             try {
-                const response = await fetch('http://127.0.0.1:8000/upload/dicom', {
-                    method: 'POST',
-                    body: formData,
-                });
-                const data = await response.json();
+                const data = await uploadDicom(file);
 
                 const instanceNumber = data['(0020, 0013)']?.value || 'Unknown Instance';
                 const seriesNumber = data['(0020, 0011)']?.value || 'Unknown Series';
@@ -876,15 +916,7 @@ function DicomViewer() {
             cornerstone.displayImage(viewerRef.current, image);
 
             // Fetch metadata
-            const formData = new FormData();
-            formData.append('dicom_file', file);
-
-            const response = await fetch('http://127.0.0.1:8000/upload/dicom', {
-                method: 'POST',
-                body: formData,
-            });
-
-            const metadata = await response.json();
+            const metadata = await extractDicomMetadata(file);
             if (!metadata.error) {
                 setMetadataFunction(metadata);
             } else {
@@ -923,7 +955,7 @@ function DicomViewer() {
     async function handleSingleFileChange(event) {
         const file = event.target.files[0]; // Get the single selected file
         if (file && file.name.endsWith('.dcm')) {
-            setNiftiVolume(null);
+            // Clear the previous file and reset the viewer
             setUploadedFiles([file]); // Replace the uploaded files with the new one
             setCurrentFileIndex(0); // Reset to the first file (since we're uploading only one)
             setMetadata(null); // Clear metadata from the previous file
@@ -935,54 +967,10 @@ function DicomViewer() {
         }
     }
 
-    async function handleNiftiFileChange(event) {
-        const file = event.target.files[0];
-        if (file && (file.name.endsWith('.nii') || file.name.endsWith('.nii.gz'))) {
-            setUploadedFiles([file]);
-            setCurrentFileIndex(0);
-            setMetadata(null);
-            setNiftiVolume(null);
-            setProcessedNiftiVolume(null);
-
-            const reader = new FileReader();
-            reader.onload = async (e) => {
-                const arrayBuffer = e.target.result;
-                await parseAndDisplayNiftiBuffer(arrayBuffer, dicomImageRef.current, setMetadata, false);
-            };
-            reader.readAsArrayBuffer(file);
-
-            setGroupedSeries({
-                "NIfTI Volume": [{
-                    fileName: file.name,
-                    instanceNumber: "1",
-                    currentFileIndex: 0,
-                    thumbnail: null
-                }]
-            });
-
-            const formData = new FormData();
-            formData.append('nifti_file', file);
-            try {
-                const response = await fetch('http://127.0.0.1:8000/upload/nifti', {
-                    method: 'POST',
-                    body: formData,
-                });
-                const data = await response.json();
-                if (data.metadata) {
-                    setMetadata((prev) => ({ ...(prev || {}), ...data.metadata }));
-                }
-            } catch (err) {
-                console.error("Backend NIfTI upload error:", err);
-            }
-        } else {
-            alert("Please select a valid .nii or .nii.gz file.");
-        }
-    }
 
     function handleFolderChange(event) {
         const files = Array.from(event.target.files).filter(file => file.name.endsWith('.dcm'));
         if (files.length > 0) {
-            setNiftiVolume(null);
             setUploadedFiles(files);
             setCurrentFileIndex(0); // Add this line to reset the current file index
             extractMetadataForFiles(files);
@@ -992,22 +980,14 @@ function DicomViewer() {
     }
 
 
-
         function loadDicomImage(file) {
             resetImageDisplay(); // Add this line at the beginning
 
             setMetadata(null); // Clear metadata for the new image
 
-        // Creates a FormData object to package the file for upload
-        const formData = new FormData();
-        formData.append('dicom_file', file);  // Appends the DICOM file to the form data under the key 'dicom_file'
-
-        fetch('http://127.0.0.1:8000/upload/dicom', {
-            method: 'POST',
-            body: formData,
-        })
-            .then(response => response.json())  // Converts the response to JSON format
-            .then(data => {   // Backend response data
+        // Upload file to FastAPI backend and retrieve metadata
+        uploadDicom(file)
+            .then(data => {   // data is the flat metadata dict from api.js
                 setMetadata(data);
 
                 // Extract metadata values from the response
@@ -1102,13 +1082,8 @@ function DicomViewer() {
             formData.append('original_dicom_path', `uploads/${uploadedFiles[currentFileIndex].name}`);
             formData.append('modified_pixel_data', new Blob([pixelData.buffer], {type: 'application/octet-stream'}), 'pixel_data.raw');
 
-            fetch('http://127.0.0.1:8000/convert/dicom-to-nifti', {
-                method: 'POST',
-                body: formData,
-            })
-                .then(response => response.json())
-                .then(data => console.log('Processed DICOM saved:', data))
-                .catch(error => console.error('Error:', error));
+            // NOTE: save-processed-dicom is not yet implemented in the FastAPI backend.
+            console.warn('save-processed-dicom endpoint not yet available in FastAPI backend.');
         } else {
             console.error('No valid image to process');
         }
@@ -1116,97 +1091,42 @@ function DicomViewer() {
 
 
     async function sendDicomToModel(file) {
-        if (!file) return;
-        const isNifti = file.name.endsWith('.nii') || file.name.endsWith('.nii.gz');
+        try {
+            const data = await sendToLocalizer(file);
+            setIsProcessedDicomVisible(true);
 
-        if (isNifti) {
-            const formData = new FormData();
-            formData.append('nifti_file', file);
+            if (data.dicom_file_data) {
+                console.log("Processed DICOM file received!");
 
-            try {
-                const response = await fetch('http://127.0.0.1:8000/localizer/nifti', {
-                    method: 'POST',
-                    body: formData,
-                });
-                if (!response.ok) {
-                    const errDetail = await response.text();
-                    throw new Error(`Localizer failed (${response.status}): ${errDetail}`);
+                // Decode the base64-encoded DICOM file
+                const byteArray = new Uint8Array(atob(data.dicom_file_data).split("").map(char => char.charCodeAt(0)));
+                const dicomBlob = new Blob([byteArray], {type: 'application/dicom'});
+
+                // Extract metadata for the processed DICOM
+                const processedMetadata = await fetchMetadata(dicomBlob);  // Call a function to fetch the metadata
+                setProcessedMetadata(processedMetadata);  // Store the metadata in state
+
+                // Display the image in the viewer
+                if (processedDicomRef.current) {
+                    cornerstone.enable(processedDicomRef.current);
+                    const imageId = cornerstoneWADOImageLoader.wadouri.fileManager.add(dicomBlob);
+                    cornerstone.loadImage(imageId).then(image => {
+                        cornerstone.displayImage(processedDicomRef.current, image);
+                    }).catch(err => console.error(err));
+
                 }
-                const data = await response.json();
-                
-                // Show the processed viewer panel
-                setIsProcessedDicomVisible(true);
-
-                if (data.nifti_file_data) {
-                    console.log("Processed NIfTI file received!");
-                    
-                    // Decode base64 to ArrayBuffer
-                    const binaryString = atob(data.nifti_file_data);
-                    const len = binaryString.length;
-                    const bytes = new Uint8Array(len);
-                    for (let i = 0; i < len; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
-                    }
-                    
-                    // Display NIfTI in processed viewer
-                    await parseAndDisplayNiftiBuffer(bytes.buffer, processedDicomRef.current, setProcessedMetadata, true);
-                }
-            } catch (error) {
-                console.error("Error sending NIfTI to localizer:", error);
-                alert("Error running localizer on NIfTI file: " + error.message);
+            } else if (data.error) {
+                console.error("Error:", data.error);
             }
-        } else {
-            const formData = new FormData();
-            formData.append('dicom_file', file);
-
-            try {
-                // Notice the URL is updated to the clean localizer/dicom route
-                const response = await fetch('http://127.0.0.1:8000/localizer/dicom', {
-                    method: 'POST',
-                    body: formData,
-                });
-                const data = await response.json();
-                
-                // Show the processed viewer panel
-                setIsProcessedDicomVisible(true);
-
-                if (data.dicom_file_data) {
-                    console.log("Processed DICOM file received!");
-                    const byteArray = new Uint8Array(atob(data.dicom_file_data).split("").map(char => char.charCodeAt(0)));
-                    const dicomBlob = new Blob([byteArray], {type: 'application/dicom'});
-                    const procMetadata = await fetchMetadata(dicomBlob);
-                    setProcessedMetadata(procMetadata);
-
-                    // Show in the processedDicomRef, NOT dicomImageRef
-                    if (processedDicomRef.current) {
-                        cornerstone.enable(processedDicomRef.current);
-                        const imageId = cornerstoneWADOImageLoader.wadouri.fileManager.add(dicomBlob);
-                        cornerstone.loadImage(imageId).then(image => {
-                            cornerstone.displayImage(processedDicomRef.current, image);
-                        }).catch(err => console.error(err));
-                    }
-                } else if (data.error) {
-                    console.error("Error:", data.error);
-                }
-            } catch (error) {
-                console.error("Error sending DICOM to model:", error);
-            }
+        } catch (error) {
+            console.error("Error sending DICOM to model:", error);
         }
     }
 
-
     // Function to extract metadata for the processed DICOM
     async function fetchMetadata(dicomBlob) {
-        const formData = new FormData();
-        formData.append('dicom_file', dicomBlob);
-
         try {
-            const response = await fetch('http://127.0.0.1:8000/extract-metadata/', {
-                method: 'POST',
-                body: formData,
-            });
-
-            const metadata = await response.json();
+            const metadata = await extractDicomMetadata(dicomBlob);
 
             if (metadata.error) {
                 console.error('Error extracting metadata:', metadata.error);
@@ -1214,7 +1134,6 @@ function DicomViewer() {
             }
 
             return metadata;
-
         } catch (error) {
             console.error('Error extracting metadata:', error);
             return null;
@@ -1273,12 +1192,13 @@ function DicomViewer() {
         });
 
         try {
-            const response = await fetch('http://127.0.0.1:8000/api/send-series-to-model/', {
-                method: 'POST',
-                body: formData,
-            });
+            // NOTE: send-series-to-model is not yet implemented in the FastAPI backend.
+            // TODO: implement POST /predict/dicom-series in FastAPI and update this call.
+            console.warn('send-series-to-model endpoint not yet available in FastAPI backend.');
+            return;
 
-            const data = await response.json();
+            // eslint-disable-next-line no-unreachable
+            const data = await (async () => { throw new Error('Not implemented'); })();
             setIsProcessedDicomVisible(true);
 
             if (data.processed_files) {
@@ -1352,17 +1272,6 @@ function DicomViewer() {
     };
 
     const handleNextImageProcessed = () => {
-        if (processedNiftiVolume) {
-            setProcessedNiftiSliceIndex((prev) => {
-                const nextIdx = Math.min(prev + 1, processedNiftiVolume.dimZ - 1);
-                displayNiftiSlice(processedNiftiVolume, nextIdx, processedDicomRef.current);
-                if (processedMetadata) {
-                    setProcessedMetadata((m) => ({ ...m, "Current Slice": String(nextIdx + 1) }));
-                }
-                return nextIdx;
-            });
-            return;
-        }
         if (processedCurrentIndex < processedSeries.length - 1) {
             const nextIndex = processedCurrentIndex + 1;
             setProcessedCurrentIndex(nextIndex);
@@ -1371,24 +1280,12 @@ function DicomViewer() {
     };
 
     const handlePreviousImageProcessed = () => {
-        if (processedNiftiVolume) {
-            setProcessedNiftiSliceIndex((prev) => {
-                const prevIdx = Math.max(prev - 1, 0);
-                displayNiftiSlice(processedNiftiVolume, prevIdx, processedDicomRef.current);
-                if (processedMetadata) {
-                    setProcessedMetadata((m) => ({ ...m, "Current Slice": String(prevIdx + 1) }));
-                }
-                return prevIdx;
-            });
-            return;
-        }
         if (processedCurrentIndex > 0) {
             const prevIndex = processedCurrentIndex - 1;
             setProcessedCurrentIndex(prevIndex);
             displayProcessedDicom(processedSeries[prevIndex]); // Update displayed image and metadata
         }
     };
-
 
 
 
@@ -1453,30 +1350,13 @@ function DicomViewer() {
 
         // hena bet7ot el output fl segemnation viewer zy el localizer keda
     async function sendDicomToNnunet(file) {
-        const formData = new FormData();
-        formData.append('dicom_file', file);
-
-        // Optional: Show loading state
         console.log("Sending DICOM to nnU-Net model...");
 
         try {
-            const response = await fetch('http://127.0.0.1:8000/segment/dicom', {
-                method: 'POST',
-                body: formData,
-            });
+            // predictDicom in api.js throws on HTTP errors; returns raw Response on success
+            const response = await predictDicom(file);
 
-            // Check if the response is successful
-            if (!response.ok) {
-                // Try to parse error message
-                try {
-                    const errorData = await response.json();
-                    throw new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`);
-                } catch (parseError) {
-                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                }
-            }
-
-            // Check if response is a file (DICOM segmentation) or JSON error
+            // Check if response is a DICOM segmentation file or JSON error
             const contentType = response.headers.get('content-type');
 
             if (contentType && contentType.includes('application/dicom')) {
@@ -1612,7 +1492,17 @@ function DicomViewer() {
 
             <nav className="bg-[#101820] text-[#76c7e8] py-2 px-4 flex items-center border-b border-[#4aa0ce] justify-between w-full">
                 {/* Upload Button - Stays on Left */}
-                <div className="relative mr-10"> {/* Margin to push buttons left */}
+                <div className="flex items-center gap-3 mr-10">
+                    {/* Backend health indicator */}
+                    <div
+                        title={backendOnline === null ? 'Checking backend…' : backendOnline ? 'Backend online' : 'Backend offline'}
+                        className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${
+                            backendOnline === null ? 'bg-yellow-400 animate-pulse' :
+                            backendOnline ? 'bg-green-400' : 'bg-red-500'
+                        }`}
+                    />
+
+                    <div className="relative"> {/* Margin to push buttons left */}
                     <button
                         onClick={() => setShowUploadDropdown(!showUploadDropdown)}
                         className="flex flex-col items-center text-[#76c7e8] transition-all duration-200 hover:text-[#4aa0ce]"
@@ -1623,7 +1513,7 @@ function DicomViewer() {
 
                     {showUploadDropdown && (
                         <div
-                            className="absolute mt-2 bg-[#101820] text-[#76c7e8] rounded-md shadow-lg border border-[#4aa0ce] backdrop-blur-md w-40">
+                            className="absolute mt-2 bg-[#101820] text-[#76c7e8] rounded-md shadow-lg border border-[#4aa0ce] backdrop-blur-md w-44 z-50">
                             <div className="flex flex-col gap-1 py-2 px-3 text-sm">
                                 <label
                                     className="flex items-center gap-2 p-2 rounded cursor-pointer transition-all duration-200 hover:bg-[#1a78a7] hover:text-white">
@@ -1636,20 +1526,7 @@ function DicomViewer() {
                                         accept=".dcm"
                                         className="hidden"
                                     />
-                                    📂 Upload DICOM File
-                                </label>
-                                <label
-                                    className="flex items-center gap-2 p-2 rounded cursor-pointer transition-all duration-200 hover:bg-[#1a78a7] hover:text-white">
-                                    <input
-                                        type="file"
-                                        onChange={(event) => {
-                                            handleNiftiFileChange(event);
-                                            setShowUploadDropdown(false);
-                                        }}
-                                        accept=".nii,.nii.gz"
-                                        className="hidden"
-                                    />
-                                    🧠 Upload NIfTI File
+                                    📂 Upload File
                                 </label>
                                 <label
                                     className="flex items-center gap-2 p-2 rounded cursor-pointer transition-all duration-200 hover:bg-[#1a78a7] hover:text-white">
@@ -1667,9 +1544,26 @@ function DicomViewer() {
                                     📁 Upload Folder
                                 </label>
 
+                                {/* ── NIfTI section ── */}
+                                <div className="border-t border-[#4aa0ce] my-1"/>
+                                <p className="text-[10px] uppercase tracking-widest text-[#4aa0ce] opacity-60 px-1">NIfTI</p>
+                                <label
+                                    className="flex items-center gap-2 p-2 rounded cursor-pointer transition-all duration-200 hover:bg-[#1a78a7] hover:text-white">
+                                    <input
+                                        type="file"
+                                        onChange={(event) => {
+                                            handleNiftiFileChange(event);
+                                            setShowUploadDropdown(false);
+                                        }}
+                                        accept=".nii,.nii.gz"
+                                        className="hidden"
+                                    />
+                                    🧠 Upload NIfTI
+                                </label>
                             </div>
                         </div>
                     )}
+                    </div>
                 </div>
 
                 {/* All Buttons Shifted Left */}
@@ -2167,6 +2061,94 @@ function DicomViewer() {
 
 
             </div>
+
+
+            {/* ── NIfTI Panel ─────────────────────────────────────────────────── */}
+            {isNiftiPanelOpen && (
+                <div
+                    className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+                    onClick={(e) => { if (e.target === e.currentTarget) setIsNiftiPanelOpen(false); }}
+                >
+                    <div className="bg-[#0d1b26] border border-[#4aa0ce] rounded-xl shadow-2xl w-[480px] max-h-[80vh] overflow-y-auto p-6 text-[#76c7e8]">
+                        {/* Header */}
+                        <div className="flex items-center justify-between mb-4">
+                            <h2 className="text-lg font-semibold tracking-wide">🧠 NIfTI Workflow</h2>
+                            <button
+                                onClick={() => setIsNiftiPanelOpen(false)}
+                                className="text-red-400 hover:text-red-300 text-xl leading-none"
+                            >✕</button>
+                        </div>
+
+                        {/* File name */}
+                        {niftiFile && (
+                            <p className="text-xs text-[#4aa0ce] mb-3 truncate">📄 {niftiFile.name}</p>
+                        )}
+
+                        {/* Status message */}
+                        {niftiStatusMsg && (
+                            <div className="mb-4 px-3 py-2 rounded bg-[#0a111a] border border-[#4aa0ce]/40 text-xs">
+                                {niftiStatusMsg}
+                            </div>
+                        )}
+
+                        {/* Metadata */}
+                        {niftiMetadata && (
+                            <div className="mb-4">
+                                <h3 className="text-sm font-medium mb-2 text-[#4aa0ce]">Volume Metadata</h3>
+                                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-[#0a111a] rounded p-3 border border-[#4aa0ce]/30">
+                                    {Object.entries(niftiMetadata).map(([key, value]) => (
+                                        <React.Fragment key={key}>
+                                            <span className="text-[#4aa0ce] opacity-70 font-medium capitalize">{key.replace(/_/g, ' ')}:</span>
+                                            <span className="text-[#76c7e8] break-all">
+                                                {Array.isArray(value) ? value.join(', ') :
+                                                 typeof value === 'object' && value !== null ? JSON.stringify(value) :
+                                                 String(value)}
+                                            </span>
+                                        </React.Fragment>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Action buttons */}
+                        <div className="flex flex-col gap-2">
+                            <button
+                                onClick={() => handleLoadNiftiToViewer()}
+                                disabled={!niftiFile || isNiftiProcessing}
+                                className="w-full py-2 rounded-lg bg-[#4aa0ce] hover:bg-[#3b8db8] disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
+                            >
+                                {isNiftiProcessing ? '⏳ Processing…' : '👁️ View Volume Slices in Viewer'}
+                            </button>
+
+                            <button
+                                onClick={handleNiftiPredict}
+                                disabled={!niftiFile || isNiftiProcessing}
+                                className="w-full py-2 rounded-lg bg-[#1a78a7] hover:bg-[#1565a0] disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
+                            >
+                                {isNiftiProcessing ? '⏳ Processing…' : '🔬 Run Segmentation (nnU-Net)'}
+                            </button>
+
+                            <button
+                                onClick={handleNiftiToDicom}
+                                disabled={!niftiFile || isNiftiProcessing}
+                                className="w-full py-2 rounded-lg bg-[#0d5e87] hover:bg-[#0a4f73] disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
+                            >
+                                {isNiftiProcessing ? '⏳ Processing…' : '🔄 Convert to DICOM Series (ZIP)'}
+                            </button>
+
+                            {niftiConvertSessionId && (
+                                <button
+                                    onClick={handleRedownloadDicom}
+                                    disabled={isNiftiProcessing}
+                                    className="w-full py-2 rounded-lg border border-[#4aa0ce] hover:bg-[#4aa0ce]/10 disabled:opacity-50 disabled:cursor-not-allowed text-[#76c7e8] text-sm font-medium transition-colors"
+                                >
+                                    ⬇️ Re-download Last DICOM ZIP
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
 
 
             {/* Footer */}
