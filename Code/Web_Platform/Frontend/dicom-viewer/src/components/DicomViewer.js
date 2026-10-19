@@ -29,6 +29,7 @@ import {
     Circle,
     DraftingCompass,
     BookOpenText,
+    Activity,
     Upload,
     ArrowUpWideNarrow,
     ArrowUp,
@@ -46,6 +47,7 @@ import {
 
 import ToolButtons from './ToolButtons';
 import MetadataTable from './MetadataTable';
+import ClinicalDataPanel from './ClinicalDataPanel';
 import Sidebar from './Sidebar';
 import PointPlacerTool from "./CurvedPolyLineTool";
 import BrushColorDropdown from "./viewer-tools/BrushColorDropdown";
@@ -78,6 +80,8 @@ function DicomViewer() {
     const [processedMetadata, setProcessedMetadata] = useState(null);
     const [isOriginalMetadataTableOpen, setIsOriginalMetadataTableOpen] = useState(false);
     const [isProcessedMetadataTableOpen, setIsProcessedMetadataTableOpen] = useState(false);
+    const [clinicalData, setClinicalData] = useState(null);
+    const [isClinicalPanelOpen, setIsClinicalPanelOpen] = useState(true);
     const dicomCanvasRef = useRef(null);  // Ref for the canvas
     const [cursorPos, setCursorPos] = useState({x: 0, y: 0});
     const [showCanvasText, setShowCanvasText] = useState(true);
@@ -222,6 +226,10 @@ function DicomViewer() {
             const result = await uploadNifti(file);
             setNiftiMetadata(result.metadata);
             setNiftiSessionId(result.session_id);
+            if (result.clinical_data) {
+                setClinicalData(result.clinical_data);
+                setIsClinicalPanelOpen(true);
+            }
             setNiftiStatusMsg(`Uploaded: ${result.filename}. Rendering slices in viewer…`);
             await handleLoadNiftiToViewer(file);
         } catch (err) {
@@ -873,6 +881,10 @@ function DicomViewer() {
 
             try {
                 const data = await uploadDicom(file);
+                if (data.clinical_data) {
+                    setClinicalData(data.clinical_data);
+                    setIsClinicalPanelOpen(true);
+                }
 
                 const instanceNumber = data['(0020, 0013)']?.value || 'Unknown Instance';
                 const seriesNumber = data['(0020, 0011)']?.value || 'Unknown Series';
@@ -989,6 +1001,10 @@ function DicomViewer() {
         uploadDicom(file)
             .then(data => {   // data is the flat metadata dict from api.js
                 setMetadata(data);
+                if (data.clinical_data) {
+                    setClinicalData(data.clinical_data);
+                    setIsClinicalPanelOpen(true);
+                }
 
                 // Extract metadata values from the response
                 // const seriesInstanceUID = data['(0020, 000E)']?.value || 'Not available';
@@ -1657,6 +1673,18 @@ function DicomViewer() {
 
 
 
+                    {/* Patient Profile and Clinical Labs Button */}
+                    <button
+                        onClick={() => setIsClinicalPanelOpen(prev => !prev)}
+                        className={`flex flex-col items-center transition-all duration-200 ${
+                            isClinicalPanelOpen ? "text-[#4aa0ce] font-semibold" : "text-[#76c7e8] hover:text-[#4aa0ce]"
+                        }`}
+                        title="Toggle Patient Profile and Clinical Biomarkers"
+                    >
+                        <Activity size={20} strokeWidth={1.5} className="mt-1"/>
+                        <span className="text-xs mt-1">Patient Profile</span>
+                    </button>
+
                     {/* Show Metadata Button */}
                     <button
                         onClick={handleShowMetadata}
@@ -1786,6 +1814,22 @@ function DicomViewer() {
                                         {isFourSplitView ? "Single View" : "2×2 Split"}
                                     </button>
                                 </div>
+                            </div>
+                        )}
+
+                        {/* Patient Profile & Clinical Lab Results Panel */}
+                        {isClinicalPanelOpen && clinicalData && (
+                            <div
+                                className="flex flex-col flex-shrink-0 relative z-20 m-1"
+                                style={{
+                                    width: IsProcessedDicomVisible || isSplitView ? '320px' : '380px',
+                                    height: '100%',
+                                }}
+                            >
+                                <ClinicalDataPanel
+                                    clinicalData={clinicalData}
+                                    onClose={() => setIsClinicalPanelOpen(false)}
+                                />
                             </div>
                         )}
                     </div>

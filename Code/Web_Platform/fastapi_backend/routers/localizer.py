@@ -66,8 +66,8 @@ async def localize_nifti(nifti_file: UploadFile = File(...)):
         fh = nib.FileHolder(fileobj=file_obj)
         nifti_img = nib.Nifti1Image.from_file_map({"header": fh, "image": fh})
         data = nifti_img.get_fdata().astype(np.float32)
-        if data.ndim != 3:
-            raise ValueError("Expected a 3D NIfTI volume.")
+        if data.ndim not in (3, 4):
+            raise ValueError(f"Expected a 3D or 4D NIfTI volume, got {data.ndim}D.")
             
         cropped = run_localizer_3d(data, str(WEIGHTS_PATH))
         nib.save(nib.Nifti1Image(cropped, nifti_img.affine, nifti_img.header), str(out_path))

@@ -89,15 +89,19 @@ def run_localizer(input_array: np.ndarray, weights_path: str) -> np.ndarray:
 
 def run_localizer_3d(volume_array: np.ndarray, weights_path: str) -> np.ndarray:
     """
-    Takes a 3D volume (H, W, D).
+    Takes a 3D (H, W, D) or 4D (H, W, D, T) volume.
     Runs the localizer on the middle slice to find the center.
-    Crops all slices to 128x128 around that center.
+    Crops all slices and phases to 128x128 around that center.
     """
     model = get_localizer_model(weights_path)
     
+    is_4d = (volume_array.ndim == 4)
     # Get middle slice
     mid_idx = volume_array.shape[2] // 2
-    mid_slice = volume_array[:, :, mid_idx]
+    if is_4d:
+        mid_slice = volume_array[:, :, mid_idx, 0]
+    else:
+        mid_slice = volume_array[:, :, mid_idx]
     
     input_tensor, resized_shape = preprocess_image(mid_slice)
     
@@ -139,7 +143,10 @@ def run_localizer_3d(volume_array: np.ndarray, weights_path: str) -> np.ndarray:
     bottom_right_y = min(mid_slice.shape[0], int(center_y_original + roi_height / 2))
     bottom_right_x = min(mid_slice.shape[1], int(center_x_original + roi_width / 2))
 
-    # Crop the whole 3D volume using the coordinates from the middle slice
-    cropped_volume = volume_array[top_left_y:bottom_right_y, top_left_x:bottom_right_x, :]
+    # Crop the whole 3D/4D volume using the coordinates from the middle slice
+    if is_4d:
+        cropped_volume = volume_array[top_left_y:bottom_right_y, top_left_x:bottom_right_x, :, :]
+    else:
+        cropped_volume = volume_array[top_left_y:bottom_right_y, top_left_x:bottom_right_x, :]
     return cropped_volume
 

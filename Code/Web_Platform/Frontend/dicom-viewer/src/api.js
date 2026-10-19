@@ -1,24 +1,13 @@
 /**
- * api.js — Centralized API service for the FastAPI backend.
+ * api.js � Centralized API service for the FastAPI backend.
  *
  * Base URL: http://127.0.0.1:8000
- *
- * FastAPI route map:
- *   POST /upload/dicom              – upload a DICOM file, returns { filename, metadata }
- *   POST /upload/nifti              – upload a NIfTI file, returns { filename, metadata }
- *   POST /upload/extract-metadata    – extract metadata, returns flat metadata dict
- *   POST /localizer/dicom           – LV localizer for DICOM, returns { message, filename, dicom_file_data }
- *   POST /localizer/nifti           – LV localizer for NIfTI, returns { message, filename, nifti_file_data }
- *   POST /segment/dicom             – nnU-Net segmentation for DICOM, returns DICOM blob
- *   POST /segment/nifti             – nnU-Net segmentation for NIfTI, returns NIfTI blob
- *   POST /convert/dicom-to-nifti      – convert DICOM to NIfTI blob
- *   POST /convert/nifti-to-dicom      – convert NIfTI to DICOM blob
  */
 
 const BASE_URL = 'http://127.0.0.1:8000';
 
 /**
- * Upload a DICOM file and receive its metadata.
+ * Upload a DICOM file and receive its metadata and patient clinical data.
  */
 export async function uploadDicom(file) {
     const formData = new FormData();
@@ -35,7 +24,49 @@ export async function uploadDicom(file) {
     }
 
     const data = await response.json();
-    return data.metadata ?? data;
+    return {
+        ...(data.metadata || {}),
+        clinical_data: data.clinical_data || data.metadata?.ClinicalData,
+        patient_id: data.patient_id,
+        filename: data.filename,
+        message: data.message
+    };
+}
+
+/**
+ * Upload a NIfTI file and receive its metadata and patient clinical data.
+ */
+export async function uploadNifti(file) {
+    const formData = new FormData();
+    formData.append('nifti_file', file);
+
+    const response = await fetch(`${BASE_URL}/upload/nifti`, {
+        method: 'POST',
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || `NIfTI upload failed (${response.status})`);
+    }
+
+    const data = await response.json();
+    return {
+        ...data,
+        clinical_data: data.clinical_data || data.metadata?.ClinicalData,
+    };
+}
+
+/**
+ * Direct lookup for clinical data & lab results by patient ID.
+ */
+export async function getClinicalData(patientId) {
+    const response = await fetch(`${BASE_URL}/upload/clinical/${patientId}`);
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || `Clinical lookup failed (${response.status})`);
+    }
+    return response.json();
 }
 
 /**
@@ -60,7 +91,6 @@ export async function extractDicomMetadata(file) {
 
 /**
  * Send a DICOM file to the LV localizer model.
- * Returns { message, filename, dicom_file_data (base64) }
  */
 export async function localizeDicom(file) {
     const formData = new FormData();
@@ -81,7 +111,6 @@ export async function localizeDicom(file) {
 
 /**
  * Send a NIfTI file to the LV localizer model.
- * Returns { message, filename, nifti_file_data (base64) }
  */
 export async function localizeNifti(file) {
     const formData = new FormData();
@@ -100,12 +129,10 @@ export async function localizeNifti(file) {
     return response.json();
 }
 
-// Backward compatibility alias
 export const sendToLocalizer = localizeDicom;
 
 /**
  * Run segmentation on a DICOM file.
- * Returns DICOM file blob
  */
 export async function predictDicom(file) {
     const formData = new FormData();
@@ -126,7 +153,6 @@ export async function predictDicom(file) {
 
 /**
  * Run segmentation on a NIfTI file.
- * Returns NIfTI file blob
  */
 export async function predictNifti(file) {
     const formData = new FormData();
@@ -143,26 +169,6 @@ export async function predictNifti(file) {
     }
 
     return response;
-}
-
-/**
- * Upload a NIfTI file and receive its metadata.
- */
-export async function uploadNifti(file) {
-    const formData = new FormData();
-    formData.append('nifti_file', file);
-
-    const response = await fetch(`${BASE_URL}/upload/nifti`, {
-        method: 'POST',
-        body: formData,
-    });
-
-    if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        throw new Error(err.detail || `NIfTI upload failed (${response.status})`);
-    }
-
-    return response.json();
 }
 
 /**
@@ -206,8 +212,7 @@ export async function dicomToNifti(file) {
 }
 
 /**
- * Health check — verify the backend is reachable.
- * Returns { status: "ok" } on success.
+ * Health check.
  */
 export async function healthCheck() {
     const response = await fetch(`${BASE_URL}/health`);

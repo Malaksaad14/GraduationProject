@@ -28,6 +28,7 @@ import {
 import { localizeDicom, localizeNifti, uploadDicom, uploadNifti, healthCheck } from '../api';
 import { parseMedicalFile, renderSliceToCanvas, base64ToArrayBuffer } from '../utils/medicalImageLoader';
 import AIChatbot from './AIChatbot';
+import ClinicalDataPanel from './ClinicalDataPanel';
 
 export default function MedicalViewer() {
     // ── File State ─────────────────────────────────────────────────────────────
@@ -35,6 +36,8 @@ export default function MedicalViewer() {
     const [parsedOriginal, setParsedOriginal] = useState(null);
     const [parsedLocalized, setParsedLocalized] = useState(null);
     const [currentSlice, setCurrentSlice] = useState(0);
+    const [currentTimeFrame, setCurrentTimeFrame] = useState(0);
+    const [cineFps, setCineFps] = useState(20);
 
     // ── Viewer Controls ────────────────────────────────────────────────────────
     const [windowCenter, setWindowCenter] = useState(0);
@@ -47,6 +50,8 @@ export default function MedicalViewer() {
 
     // ── UI / Split View State ──────────────────────────────────────────────────
     const [isSplitView, setIsSplitView] = useState(false);
+    const [clinicalData, setClinicalData] = useState(null);
+    const [showClinicalPanel, setShowClinicalPanel] = useState(true);
     const [isLoadingLocalizer, setIsLoadingLocalizer] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
@@ -82,14 +87,25 @@ export default function MedicalViewer() {
             .catch(() => setBackendStatus('offline'));
     }, []);
 
-    // ── Cine Loop Animation ────────────────────────────────────────────────────
+    // ── Cine Loop Animation (Supports 4D Time-Frames & 3D Slices) ──────────────
     useEffect(() => {
-        if (!isPlayingCine || !parsedOriginal || parsedOriginal.numSlices <= 1) return;
+        if (!isPlayingCine || !parsedOriginal) return;
+
+        const is4DCine = (parsedOriginal.numTimeFrames || 1) > 1;
+        const totalSteps = is4DCine ? parsedOriginal.numTimeFrames : parsedOriginal.numSlices;
+        if (totalSteps <= 1) return;
+
+        const intervalMs = Math.round(1000 / (cineFps || 20));
         const timer = setInterval(() => {
-            setCurrentSlice((prev) => (prev + 1) % parsedOriginal.numSlices);
-        }, 120);
+            if (is4DCine) {
+                setCurrentTimeFrame((prev) => (prev + 1) % parsedOriginal.numTimeFrames);
+            } else {
+                setCurrentSlice((prev) => (prev + 1) % parsedOriginal.numSlices);
+            }
+        }, intervalMs);
+
         return () => clearInterval(timer);
-    }, [isPlayingCine, parsedOriginal]);
+    }, [isPlayingCine, parsedOriginal, cineFps]);
 
     // ── File Processing ────────────────────────────────────────────────────────
     const processUploadedFile = async (file) => {
@@ -106,17 +122,30 @@ export default function MedicalViewer() {
             const parsed = await parseMedicalFile(buffer, file.name);
             setParsedOriginal(parsed);
             setCurrentSlice(0);
+            setCurrentTimeFrame(0);
             setWindowCenter(parsed.defaultWindowCenter);
             setWindowWidth(parsed.defaultWindowWidth);
             setZoom(1);
             setPan({ x: 0, y: 0 });
             setStatusMessage(`Successfully loaded ${file.name} (${parsed.type.toUpperCase()})`);
 
-            // Also upload metadata to backend silently
+            // Also upload metadata and fetch patient clinical profile
             if (parsed.type === 'dicom') {
-                uploadDicom(file).catch(console.warn);
+                uploadDicom(file).then(res => {
+                    console.log("[MedicalViewer] DICOM upload result:", res);
+                    if (res && res.clinical_data) {
+                        setClinicalData(res.clinical_data);
+                        setShowClinicalPanel(true);
+                    }
+                }).catch(console.warn);
             } else {
-                uploadNifti(file).catch(console.warn);
+                uploadNifti(file).then(res => {
+                    console.log("[MedicalViewer] NIfTI upload result:", res);
+                    if (res && res.clinical_data) {
+                        setClinicalData(res.clinical_data);
+                        setShowClinicalPanel(true);
+                    }
+                }).catch(console.warn);
             }
         } catch (err) {
             console.error('Error parsing file:', err);
@@ -141,8 +170,8 @@ export default function MedicalViewer() {
     const renderViews = useCallback(() => {
         if (!parsedOriginal) return;
 
-        // Render Original Canvas
-        const origSliceData = parsedOriginal.getSliceData(currentSlice);
+        // Render Original Canvas (using spatial slice and cardiac time-frame)
+        const origSliceData = parsedOriginal.getSliceData(currentSlice, currentTimeFrame);
         if (origCanvasRef.current && origSliceData) {
             renderSliceToCanvas(
                 origCanvasRef.current,
@@ -156,25 +185,31 @@ export default function MedicalViewer() {
             );
         }
 
-        // Render Localized Canvas if present
+        // Render Localized Canvas if present (synchronized slice & phase)
         if (isSplitView && parsedLocalized && locCanvasRef.current) {
             const locSliceData = parsedLocalized.getSliceData(
-                Math.min(currentSlice, parsedLocalized.numSlices - 1)
+                Math.min(currentSlice, parsedLocalized.numSlices - 1),
+                Math.min(currentTimeFrame, (parsedLocalized.numTimeFrames || 1) - 1)
             );
             if (locSliceData) {
+                // Use the localized volume's own window level so the ROI is always visible,
+                // regardless of the original scan's window/level settings.
+                const locWC = parsedLocalized.defaultWindowCenter;
+                const locWW = parsedLocalized.defaultWindowWidth;
                 renderSliceToCanvas(
                     locCanvasRef.current,
                     locSliceData,
                     parsedLocalized.cols,
                     parsedLocalized.rows,
-                    windowCenter,
-                    windowWidth,
+                    locWC,
+                    locWW,
                     parsedLocalized.min,
                     parsedLocalized.max
                 );
             }
         }
-    }, [parsedOriginal, parsedLocalized, isSplitView, currentSlice, windowCenter, windowWidth]);
+
+    }, [parsedOriginal, parsedLocalized, isSplitView, currentSlice, currentTimeFrame, windowCenter, windowWidth]);
 
     useEffect(() => {
         renderViews();
@@ -188,7 +223,7 @@ export default function MedicalViewer() {
             cancelAnimationFrame(animId);
             clearTimeout(timer);
         };
-    }, [renderViews, isSplitView, parsedLocalized]);
+    }, [renderViews, isSplitView, parsedLocalized, currentSlice, currentTimeFrame]);
 
     const [localizedRawData, setLocalizedRawData] = useState(null);
     const [isDownloadMenuOpen, setIsDownloadMenuOpen] = useState(false);
@@ -312,11 +347,19 @@ export default function MedicalViewer() {
         if (e.ctrlKey || activeTool === 'zoom') {
             const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
             setZoom((prev) => Math.max(0.2, Math.min(10, +(prev * zoomFactor).toFixed(3))));
-        } else if (parsedOriginal.numSlices > 1) {
-            if (e.deltaY > 0) {
-                setCurrentSlice((prev) => Math.min(parsedOriginal.numSlices - 1, prev + 1));
-            } else {
-                setCurrentSlice((prev) => Math.max(0, prev - 1));
+        } else if (parsedOriginal) {
+            if (e.shiftKey && (parsedOriginal.numTimeFrames || 1) > 1) {
+                if (e.deltaY > 0) {
+                    setCurrentTimeFrame((prev) => Math.min(parsedOriginal.numTimeFrames - 1, prev + 1));
+                } else {
+                    setCurrentTimeFrame((prev) => Math.max(0, prev - 1));
+                }
+            } else if (parsedOriginal.numSlices > 1) {
+                if (e.deltaY > 0) {
+                    setCurrentSlice((prev) => Math.min(parsedOriginal.numSlices - 1, prev + 1));
+                } else {
+                    setCurrentSlice((prev) => Math.max(0, prev - 1));
+                }
             }
         }
     };
@@ -555,8 +598,23 @@ export default function MedicalViewer() {
 
                     <div className="h-6 w-px bg-slate-800 mx-1" />
 
+                    {/* Patient Profile & Clinical Labs Button */}
                     <button
-                        onClick={() => setShowMetadata(!showMetadata)}
+                        onClick={() => { setShowClinicalPanel(prev => !prev); if (!showClinicalPanel) setShowMetadata(false); }}
+                        disabled={!parsedOriginal}
+                        className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border font-medium transition ${
+                            showClinicalPanel
+                                ? 'bg-cyan-600/30 border-cyan-500 text-cyan-300'
+                                : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
+                        }`}
+                        title="Toggle Patient Profile and Clinical Biomarkers"
+                    >
+                        <Activity className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Patient Profile</span>
+                    </button>
+
+                    <button
+                        onClick={() => { setShowMetadata(prev => !prev); if (!showMetadata) setShowClinicalPanel(false); }}
                         disabled={!parsedOriginal}
                         className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border font-medium transition ${showMetadata ? 'bg-blue-950 text-blue-300 border-blue-700/80 shadow-sm' : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800'} ${!parsedOriginal ? 'opacity-40 cursor-not-allowed' : ''}`}
                     >
@@ -583,6 +641,16 @@ export default function MedicalViewer() {
                         <span className="text-xl font-bold tracking-wide">Drop DICOM or NIfTI File Here</span>
                         <span className="text-xs text-cyan-400">Supports .dcm, .dicom, .nii, .nii.gz</span>
                     </div>
+                )}
+
+                {/* Side Drawer for Patient Profile & Clinical Labs (Left Side) */}
+                {showClinicalPanel && (
+                    <aside className="w-80 sm:w-96 bg-[#0a0f18] border-r border-slate-800/80 p-3 overflow-y-auto z-20 shadow-2xl flex flex-col">
+                        <ClinicalDataPanel
+                            clinicalData={clinicalData}
+                            onClose={() => setShowClinicalPanel(false)}
+                        />
+                    </aside>
                 )}
 
                 {/* Side Drawer for Metadata */}
@@ -682,6 +750,9 @@ export default function MedicalViewer() {
                             <div className="absolute top-3 right-3 z-10 bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-800 text-[11px] font-mono text-slate-300 space-y-0.5 shadow-md">
                                 <div>Dim: {parsedOriginal.cols}×{parsedOriginal.rows}</div>
                                 <div>Slice: {currentSlice + 1} / {parsedOriginal.numSlices}</div>
+                                {((parsedOriginal.numTimeFrames || 1) > 1) && (
+                                    <div className="text-emerald-400 font-bold">Phase: {currentTimeFrame + 1} / {parsedOriginal.numTimeFrames} {isPlayingCine ? '• CINE' : ''}</div>
+                                )}
                             </div>
 
                             {/* Canvas Wrapper */}
@@ -729,6 +800,8 @@ export default function MedicalViewer() {
                                         <div>ROI Extracted ✅</div>
                                     </div>
                                 )}
+
+
 
                                 {/* Canvas Wrapper */}
                                 <div className="flex-1 flex items-center justify-center overflow-hidden bg-black relative">
