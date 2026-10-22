@@ -142,6 +142,13 @@ export async function parseMedicalFile(arrayBuffer, filename) {
         const patientID = dataset.string('x00100020') || 'N/A';
         const modality = dataset.string('x00080060') || 'MR';
         const heartRate = dataset.string('x00181088') || 'N/A';
+        const manufacturer = dataset.string('x00080070');
+        const scannerModel = dataset.string('x00081090');
+        const stationName = dataset.string('x00081010');
+        const institutionName = dataset.string('x00080080');
+        const fieldStrength = dataset.string('x00180087');
+        const studyDesc = dataset.string('x00081030');
+        const seriesDesc = dataset.string('x0008103e');
 
         const pixelDataElement = dataset.elements.x7fe00010;
         if (!pixelDataElement) {
@@ -206,7 +213,14 @@ export async function parseMedicalFile(arrayBuffer, filename) {
                 Dimensions: isCine ? `${cols} × ${rows} (${numFrames} Frames CINE)` : `${cols} × ${rows}`,
                 NumberOfFrames: numFrames,
                 IsCine: isCine ? 'Yes (Multi-frame Cine)' : 'No (Single frame)',
-                HeartRate: heartRate,
+                HeartRate: heartRate !== 'N/A' ? `${heartRate} bpm` : 'N/A',
+                Manufacturer: manufacturer || 'N/A',
+                ScannerModel: scannerModel || 'N/A',
+                StationName: stationName || 'N/A',
+                InstitutionName: institutionName || 'N/A',
+                FieldStrength: fieldStrength ? `${fieldStrength} T` : 'N/A',
+                StudyDescription: studyDesc || 'N/A',
+                SeriesDescription: seriesDesc || 'N/A',
                 BitsAllocated: bitsAllocated,
                 WindowCenter: wc.toFixed(1),
                 WindowWidth: ww.toFixed(1),
@@ -218,9 +232,53 @@ export async function parseMedicalFile(arrayBuffer, filename) {
 }
 
 /**
- * Render slice pixel data onto canvas with Window / Level adjustment.
+ * Check if a filename represents a Ground Truth segmentation mask.
  */
-export function renderSliceToCanvas(canvas, sliceData, cols, rows, windowCenter, windowWidth, minVal, maxVal) {
+export function isGroundTruthMask(filename = '') {
+    const fn = filename.toLowerCase();
+    return (
+        fn.includes('_gt.') ||
+        fn.includes('_gt_') ||
+        fn.endsWith('_gt.nii') ||
+        fn.endsWith('_gt.nii.gz') ||
+        fn.endsWith('_gt') ||
+        fn.includes('_mask.') ||
+        fn.includes('_seg.') ||
+        fn.includes('_label.')
+    );
+}
+
+/**
+ * Extract canonical base name of scan (stripping extension and any _gt / _mask suffix).
+ */
+export function getBaseScanName(filename = '') {
+    return filename
+        .replace(/\.nii\.gz$/i, '')
+        .replace(/\.nii$/i, '')
+        .replace(/\.dcm$/i, '')
+        .replace(/\.dicom$/i, '')
+        .replace(/_gt$/i, '')
+        .replace(/_mask$/i, '')
+        .replace(/_seg$/i, '')
+        .replace(/_label$/i, '');
+}
+
+/**
+ * Render slice pixel data onto canvas with Window / Level adjustment and optional segmentation mask overlay.
+ */
+export function renderSliceToCanvas(
+    canvas,
+    sliceData,
+    cols,
+    rows,
+    windowCenter,
+    windowWidth,
+    minVal,
+    maxVal,
+    maskSliceData = null,
+    maskOpacity = 0.5,
+    maskPalette = 'groundTruth' // 'groundTruth' | 'ai'
+) {
     if (!canvas || !sliceData || cols <= 0 || rows <= 0) return;
 
     canvas.width = cols;
@@ -235,6 +293,21 @@ export function renderSliceToCanvas(canvas, sliceData, cols, rows, windowCenter,
     const upper = wc + ww / 2;
     const range = upper - lower || 1;
 
+    // Palette: [R, G, B]
+    const getMaskRgb = (val, palette) => {
+        const isGt = palette === 'groundTruth';
+        const label = Math.round(val);
+        // Cardiac anatomical labels: 1 = LV Myo, 2 = LV Cavity / Blood Pool, 3 = RV
+        if (label === 1) return isGt ? [16, 185, 129] : [6, 182, 212];    // Emerald (GT) vs Cyan (AI)
+        if (label === 2) return isGt ? [239, 68, 68] : [168, 85, 247];    // Red (GT) vs Purple (AI)
+        if (label === 3) return isGt ? [245, 158, 11] : [59, 130, 246];   // Amber (GT) vs Blue (AI)
+        if (label > 0) return isGt ? [16, 185, 129] : [6, 182, 212];      // Any other label
+        return null;
+    };
+
+    const hasMask = Boolean(maskSliceData && maskSliceData.length === sliceData.length);
+    const alpha = Math.max(0, Math.min(1, maskOpacity));
+
     for (let i = 0; i < sliceData.length; i++) {
         const val = sliceData[i];
         let norm;
@@ -243,6 +316,18 @@ export function renderSliceToCanvas(canvas, sliceData, cols, rows, windowCenter,
         else norm = ((val - lower) / range) * 255;
 
         const idx = i * 4;
+
+        if (hasMask && maskSliceData[i] > 0) {
+            const rgb = getMaskRgb(maskSliceData[i], maskPalette);
+            if (rgb) {
+                data[idx] = Math.round(norm * (1 - alpha) + rgb[0] * alpha);
+                data[idx + 1] = Math.round(norm * (1 - alpha) + rgb[1] * alpha);
+                data[idx + 2] = Math.round(norm * (1 - alpha) + rgb[2] * alpha);
+                data[idx + 3] = 255;
+                continue;
+            }
+        }
+
         data[idx] = norm;
         data[idx + 1] = norm;
         data[idx + 2] = norm;
@@ -264,3 +349,40 @@ export function base64ToArrayBuffer(base64) {
     }
     return bytes.buffer;
 }
+
+/**
+ * Generate a thumbnail Data URL from a parsed medical file.
+ */
+export function generateThumbnailUrl(parsed, targetSize = 128) {
+    if (!parsed || !parsed.getSliceData) return null;
+    try {
+        const midSlice = Math.floor((parsed.numSlices || 1) / 2);
+        const midTime = Math.floor((parsed.numTimeFrames || 1) / 2);
+        const sliceData = parsed.getSliceData(midSlice, midTime);
+        if (!sliceData || sliceData.length === 0) return null;
+
+        const offCanvas = document.createElement('canvas');
+        renderSliceToCanvas(
+            offCanvas,
+            sliceData,
+            parsed.cols,
+            parsed.rows,
+            parsed.defaultWindowCenter,
+            parsed.defaultWindowWidth,
+            parsed.min,
+            parsed.max
+        );
+
+        const thumbCanvas = document.createElement('canvas');
+        thumbCanvas.width = targetSize;
+        thumbCanvas.height = targetSize;
+        const ctx = thumbCanvas.getContext('2d');
+        ctx.drawImage(offCanvas, 0, 0, targetSize, targetSize);
+        return thumbCanvas.toDataURL('image/jpeg', 0.85);
+    } catch (e) {
+        console.warn('Error generating thumbnail:', e);
+        return null;
+    }
+}
+
+

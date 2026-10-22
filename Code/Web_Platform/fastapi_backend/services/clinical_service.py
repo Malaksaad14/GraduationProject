@@ -39,21 +39,17 @@ def load_csv_data():
 
 def extract_patient_id(filename: str, ds=None) -> str:
     """
-    Extracts patient ID from DICOM header or filename.
-    Prioritizes EMIDEC codes like N012, P001, or numeric codes like 001, 12.
+    Extracts patient ID from DICOM header or filename without mangling IDs.
     """
     if ds is not None:
         raw_id = getattr(ds, "PatientID", None) or getattr(ds, "PatientName", None)
         if raw_id:
             raw_str = str(raw_id).strip()
-            # Match N012 or P001
-            m = re.search(r"([NP]\d+)", raw_str, re.IGNORECASE)
-            if m:
-                return m.group(1).upper()
-            digits = re.findall(r"\d+", raw_str)
-            if digits:
-                return digits[0]
-            if raw_str and raw_str != "N/A":
+            if raw_str and raw_str.upper() not in ("N/A", "NONE", "UNKNOWN", "ANONYMOUS", "ANONYMIZED"):
+                # If EMIDEC pattern like N012 or P001, preserve upper code
+                m = re.search(r"\b([NP]\d+)\b", raw_str, re.IGNORECASE)
+                if m:
+                    return m.group(1).upper()
                 return raw_str
 
     # Check filename e.g. 'Case_N012.nii.gz', 'Case N012.txt', 'P005.dcm', '001_SA_CINE.nii'
@@ -62,12 +58,192 @@ def extract_patient_id(filename: str, ds=None) -> str:
     if m_np:
         return m_np.group(1).upper()
 
-    # 2. General digits
-    m_num = re.search(r"(?:patient|case[_-]?[pn]?|subject[_-]?)?0*(\d+)", filename, re.IGNORECASE)
-    if m_num:
-        return m_num.group(1)
+    # 2. M&Ms-2 3-digit pattern strictly at beginning e.g. '001_SA_CINE.nii'
+    m_mms = re.match(r"^(\d{3})_(?:SA|LA|2CH|4CH|CINE|ED|ES)", filename, re.IGNORECASE)
+    if m_mms:
+        return m_mms.group(1)
 
-    return "Unknown"
+    # 3. Explicit prefix like patient_01 or subject-12
+    m_pref = re.search(r"(?:patient|case|subject)[_-\s]*([A-Za-z0-9_-]+)", filename, re.IGNORECASE)
+    if m_pref:
+        return m_pref.group(1).strip()
+
+    # Fallback to filename stem
+    clean_stem = Path(filename).name.replace(".nii.gz", "").replace(".nii", "").replace(".dcm", "").replace(".dicom", "")
+    return clean_stem or "Unknown"
+
+def extract_clinical_from_dicom(ds, filename: str = "") -> dict:
+    """
+    Extracts clinical & scanner metadata directly from authoritative DICOM headers.
+    Avoids any incorrect fallback to external CSV files (e.g. M&Ms-2) for non-M&Ms scans.
+    """
+    def _clean(val):
+        if val is None:
+            return None
+        s = str(val).strip()
+        if s.lower() in ("", "none", "n/a", "null", "unknown", "nan"):
+            return None
+        return s
+
+    raw_pid = _clean(getattr(ds, "PatientID", None))
+    raw_pname = _clean(getattr(ds, "PatientName", None))
+    
+    # Clean patient ID
+    patient_id = raw_pid or raw_pname or (Path(filename).stem if filename else "Unknown")
+    
+    # Demographics
+    demographics: Dict[str, Any] = {"id": str(patient_id)}
+    if raw_pname and raw_pname != raw_pid and raw_pname.upper() not in ("ANONYMOUS", "ANONYMIZED"):
+        # Format DICOM caret name like "DOE^JOHN" to "DOE JOHN"
+        clean_name = raw_pname.replace("^", " ").strip()
+        if clean_name:
+            demographics["name"] = clean_name
+    
+    # Age
+    raw_age = _clean(getattr(ds, "PatientAge", None))
+    if raw_age:
+        age_digits = re.findall(r"\d+", raw_age)
+        if age_digits:
+            demographics["age"] = int(age_digits[0])
+    elif getattr(ds, "PatientBirthDate", None) and getattr(ds, "StudyDate", None):
+        try:
+            b_year = int(str(ds.PatientBirthDate)[:4])
+            s_year = int(str(ds.StudyDate)[:4])
+            if s_year > b_year:
+                demographics["age"] = s_year - b_year
+        except Exception:
+            pass
+
+    # Gender
+    raw_sex = _clean(getattr(ds, "PatientSex", None))
+    if raw_sex:
+        s_upper = raw_sex.upper()
+        demographics["gender"] = "Female" if s_upper.startswith("F") else ("Male" if s_upper.startswith("M") else raw_sex)
+
+    # Weight & Size/Height
+    raw_weight = _clean(getattr(ds, "PatientWeight", None))
+    if raw_weight:
+        try:
+            demographics["weight"] = f"{float(raw_weight):.1f} kg"
+        except Exception:
+            demographics["weight"] = f"{raw_weight} kg"
+
+    raw_size = _clean(getattr(ds, "PatientSize", None))
+    if raw_size:
+        try:
+            demographics["height"] = f"{float(raw_size):.2f} m"
+        except Exception:
+            demographics["height"] = f"{raw_size} m"
+
+    # Additional Clinical Notes / History if embedded in DICOM
+    clinical_history = (
+        _clean(getattr(ds, "AdditionalPatientHistory", None)) or
+        _clean(getattr(ds, "PatientComments", None)) or
+        _clean(getattr(ds, "MedicalAlerts", None)) or
+        _clean(getattr(ds, "AdmittingDiagnosesDescription", None))
+    )
+    if clinical_history:
+        demographics["clinical_notes"] = clinical_history
+
+    # Scanner & Acquisition Specs
+    imaging_specs: Dict[str, Any] = {}
+    
+    station = _clean(getattr(ds, "StationName", None))
+    institution = _clean(getattr(ds, "InstitutionName", None))
+    study_desc = _clean(getattr(ds, "StudyDescription", None))
+    series_desc = _clean(getattr(ds, "SeriesDescription", None))
+    protocol = _clean(getattr(ds, "ProtocolName", None))
+    vendor = _clean(getattr(ds, "Manufacturer", None))
+    scanner = _clean(getattr(ds, "ManufacturerModelName", None))
+    
+    # Infer meaningful dataset / study title
+    if study_desc:
+        imaging_specs["dataset"] = study_desc
+    elif institution:
+        imaging_specs["dataset"] = f"{institution} Cardiac Study"
+    elif station:
+        imaging_specs["dataset"] = f"{station} Acquisition"
+    else:
+        imaging_specs["dataset"] = "Native DICOM Acquisition"
+
+    if vendor:
+        imaging_specs["vendor"] = vendor
+    if scanner:
+        imaging_specs["scanner"] = scanner
+    if station:
+        imaging_specs["station"] = station
+    if institution:
+        imaging_specs["institution"] = institution
+
+    # Magnetic Field Strength (e.g. 3.0T, 1.5T)
+    field = getattr(ds, "MagneticFieldStrength", None)
+    if field is not None:
+        try:
+            field_f = float(field)
+            imaging_specs["field_strength"] = f"{field_f:.1f} T"
+        except Exception:
+            imaging_specs["field_strength"] = f"{field} T"
+
+    modality = _clean(getattr(ds, "Modality", None)) or "MR"
+    imaging_specs["modality"] = f"Cardiac {modality}" if modality == "MR" else modality
+
+    if series_desc:
+        imaging_specs["series_description"] = series_desc
+    if protocol:
+        imaging_specs["protocol_name"] = protocol
+
+    heart_rate = _clean(getattr(ds, "HeartRate", None))
+    if heart_rate:
+        imaging_specs["heart_rate"] = f"{heart_rate} bpm"
+
+    rep_time = getattr(ds, "RepetitionTime", None)
+    if rep_time is not None:
+        imaging_specs["repetition_time"] = f"{rep_time} ms"
+
+    echo_time = getattr(ds, "EchoTime", None)
+    if echo_time is not None:
+        imaging_specs["echo_time"] = f"{echo_time} ms"
+
+    flip = getattr(ds, "FlipAngle", None)
+    if flip is not None:
+        imaging_specs["flip_angle"] = f"{flip}°"
+
+    study_date = _clean(getattr(ds, "StudyDate", None))
+    if study_date and len(study_date) == 8:
+        imaging_specs["study_date"] = f"{study_date[:4]}-{study_date[4:6]}-{study_date[6:]}"
+
+    available_sections = []
+    if demographics:
+        available_sections.append("demographics")
+    if imaging_specs:
+        available_sections.append("imaging_specs")
+
+    return {
+        "found": True,
+        "source": "DICOM Header (Native Metadata)",
+        "patient_id": str(patient_id),
+        "is_dicom_native": True,
+        "available_sections": available_sections,
+        "demographics": demographics,
+        "imaging_specs": imaging_specs,
+        "lab_results": [],
+        "risk_factors": {},
+        "notice": "Metadata extracted directly from DICOM headers. No external lab test or clinical records attached.",
+        "raw_record": {
+            k: v for k, v in {
+                "PatientID": getattr(ds, "PatientID", None),
+                "PatientName": str(getattr(ds, "PatientName", "")),
+                "Manufacturer": getattr(ds, "Manufacturer", None),
+                "Model": getattr(ds, "ManufacturerModelName", None),
+                "Station": getattr(ds, "StationName", None),
+                "Institution": getattr(ds, "InstitutionName", None),
+                "FieldStrength": getattr(ds, "MagneticFieldStrength", None),
+                "StudyDescription": getattr(ds, "StudyDescription", None),
+                "SeriesDescription": getattr(ds, "SeriesDescription", None),
+                "Protocol": getattr(ds, "ProtocolName", None),
+            }.items() if v is not None and str(v).strip() != ""
+        }
+    }
 
 def _find_emidec_txt_file(patient_id: str) -> Optional[Path]:
     """Locates the real .txt file for an EMIDEC patient."""
@@ -133,15 +309,18 @@ def _parse_emidec_txt(txt_path: Path) -> Dict[str, str]:
                 data[k.strip()] = v.strip()
     return data
 
-def get_clinical_data(patient_id_raw: str) -> dict:
+def get_clinical_data(patient_id_raw: str, filename: str = "") -> dict:
     """
-    Primary: Parses real EMIDEC .txt file — ONLY for IDs with N or P prefix (e.g. N012, P005).
-    Fallback: Uses dataset_information.csv for purely numeric IDs (e.g. M&Ms-2 patients).
+    Looks up external clinical history or biomarker records.
+    1. Primary: Real EMIDEC .txt file — ONLY for EMIDEC cases (starts with N or P, or has Case N/P).
+    2. Secondary: dataset_information.csv — STRICTLY for M&Ms-2 scans (naming e.g. 001_SA_ED.nii).
+    3. Otherwise: Returns found=False gracefully without injecting false data or leaking M&Ms-2 records.
     """
     clean_id = str(patient_id_raw).strip()
+    fn = str(filename or "").strip()
 
-    # EMIDEC IDs always start with N or P — skip txt search for pure-numeric M&Ms-2 IDs
-    is_emidec_id = bool(re.match(r'^[NP]\d+$', clean_id, re.IGNORECASE))
+    # 1. EMIDEC Lookup (ONLY if patient ID or filename matches EMIDEC pattern)
+    is_emidec_id = bool(re.match(r'^[NP]\d+$', clean_id, re.IGNORECASE)) or bool(re.search(r'(?:case[\s_-]*)?[NP]\d+', fn, re.IGNORECASE))
     txt_file = _find_emidec_txt_file(clean_id) if is_emidec_id else None
 
     if txt_file and txt_file.exists():
@@ -274,56 +453,64 @@ def get_clinical_data(patient_id_raw: str) -> dict:
         except Exception as e:
             print(f"[ClinicalService] Error parsing .txt file {txt_file}: {e}")
 
-    # Fallback to CSV
-    csv_records = load_csv_data()
-    digits_match = re.findall(r"\d+", clean_id)
-    search_key = str(int(digits_match[0])) if digits_match else clean_id
-    row = csv_records.get(search_key)
+    # 2. M&Ms-2 Lookup: STRICTLY only if this file is genuinely an M&Ms-2 scan!
+    # M&Ms-2 files are named e.g. '001_SA_CINE.nii', '003_SA_ED.nii.gz', '012_LA_2CH.nii'
+    is_mms2 = bool(re.match(r'^\d{3}_(?:SA|LA|2CH|4CH|CINE|ED|ES)', fn, re.IGNORECASE))
+    if not is_mms2 and bool(re.match(r'^\d{1,3}$', clean_id)) and any(k in fn.upper() for k in ('SA_', 'LA_', 'CINE', 'ED', 'ES')):
+        is_mms2 = True
 
-    if row:
-        disease_code = str(row.get("DISEASE", "")).strip().upper() or None
-        vendor  = str(row.get("VENDOR",  "")).strip() or None
-        scanner = str(row.get("SCANNER", "")).strip() or None
-        field   = str(row.get("FIELD",   "")).strip() or None
-        centre  = str(row.get("CENTRE",  "")).strip() or None
+    if is_mms2:
+        csv_records = load_csv_data()
+        digits_match = re.findall(r"\d+", clean_id)
+        search_key = str(int(digits_match[0])) if digits_match else clean_id
+        row = csv_records.get(search_key)
 
-        # Build only the demographic fields that actually exist in this CSV row
-        demographics: Dict[str, Any] = {"id": clean_id}
-        if disease_code:
-            diagnosis = "Normal Control" if disease_code == "NOR" else "Cardiac Abnormality"
-            demographics["disease_code"] = disease_code
-            demographics["diagnosis"]    = diagnosis
-            demographics["category"]     = disease_code
-            demographics["severity"]     = "Low" if disease_code == "NOR" else "Moderate"
+        if row:
+            disease_code = str(row.get("DISEASE", "")).strip().upper() or None
+            vendor  = str(row.get("VENDOR",  "")).strip() or None
+            scanner = str(row.get("SCANNER", "")).strip() or None
+            field   = str(row.get("FIELD",   "")).strip() or None
+            centre  = str(row.get("CENTRE",  "")).strip() or None
 
-        # Build imaging_specs only from real CSV columns
-        imaging_specs: Dict[str, Any] = {}
-        if vendor:  imaging_specs["vendor"] = vendor
-        if scanner: imaging_specs["scanner"] = scanner
-        if field:   imaging_specs["field_strength"] = f"{field} T" if not field.endswith("T") else field
-        if centre:  imaging_specs["centre"] = centre
-        imaging_specs["dataset"] = "M&Ms-2 / CSV"
+            # Build only the demographic fields that actually exist in this CSV row
+            demographics: Dict[str, Any] = {"id": clean_id}
+            if disease_code:
+                diagnosis = "Normal Control" if disease_code == "NOR" else "Cardiac Abnormality"
+                demographics["disease_code"] = disease_code
+                demographics["diagnosis"]    = diagnosis
+                demographics["category"]     = disease_code
+                demographics["severity"]     = "Low" if disease_code == "NOR" else "Moderate"
 
-        available_sections = ["demographics"]
-        if imaging_specs:
-            available_sections.append("imaging_specs")
+            # Build imaging_specs only from real CSV columns
+            imaging_specs: Dict[str, Any] = {}
+            if vendor:  imaging_specs["vendor"] = vendor
+            if scanner: imaging_specs["scanner"] = scanner
+            if field:   imaging_specs["field_strength"] = f"{field} T" if not field.endswith("T") else field
+            if centre:  imaging_specs["centre"] = centre
+            imaging_specs["dataset"] = "M&Ms-2 Challenge"
 
-        return {
-            "found": True,
-            "source": "dataset_information.csv",
-            "patient_id": clean_id,
-            "available_sections": available_sections,
-            "demographics": demographics,
-            "imaging_specs": imaging_specs,
-            "lab_results": [],      # CSV has no lab data
-            "risk_factors": {},
-            "raw_record": {k: v for k, v in row.items() if v and str(v).strip() not in ("", "Unknown", "N/A")}
-        }
+            available_sections = ["demographics"]
+            if imaging_specs:
+                available_sections.append("imaging_specs")
 
+            return {
+                "found": True,
+                "source": "M&Ms-2 Clinical Record (dataset_information.csv)",
+                "patient_id": clean_id,
+                "available_sections": available_sections,
+                "demographics": demographics,
+                "imaging_specs": imaging_specs,
+                "lab_results": [],      # CSV has no lab data
+                "risk_factors": {},
+                "raw_record": {k: v for k, v in row.items() if v and str(v).strip() not in ("", "Unknown", "N/A")}
+            }
+
+    # 3. Graceful fallback for anonymized / non-cataloged datasets
     return {
         "found": False,
         "patient_id": clean_id,
-        "message": f"No EMIDEC .txt or CSV record found for Patient ID: {clean_id}"
+        "source": "None",
+        "message": "Metadata sourced from image headers only / No external clinical record or lab results attached."
     }
 
 # Pre-load fallback CSV

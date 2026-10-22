@@ -23,21 +23,41 @@ import {
     HelpCircle,
     X,
     Sparkles,
-    Layers
+    Layers,
+    FolderOpen,
+    ShieldCheck
 } from 'lucide-react';
 import { localizeDicom, localizeNifti, uploadDicom, uploadNifti, healthCheck } from '../api';
-import { parseMedicalFile, renderSliceToCanvas, base64ToArrayBuffer } from '../utils/medicalImageLoader';
+import {
+    parseMedicalFile,
+    renderSliceToCanvas,
+    base64ToArrayBuffer,
+    generateThumbnailUrl,
+    isGroundTruthMask,
+    getBaseScanName
+} from '../utils/medicalImageLoader';
 import AIChatbot from './AIChatbot';
 import ClinicalDataPanel from './ClinicalDataPanel';
+import SeriesBrowser, { getSequenceFriendlyName } from './SeriesBrowser';
 
 export default function MedicalViewer() {
-    // ── File State ─────────────────────────────────────────────────────────────
+    // ── File & Series State ────────────────────────────────────────────────────
     const [rawFile, setRawFile] = useState(null);
     const [parsedOriginal, setParsedOriginal] = useState(null);
     const [parsedLocalized, setParsedLocalized] = useState(null);
     const [currentSlice, setCurrentSlice] = useState(0);
     const [currentTimeFrame, setCurrentTimeFrame] = useState(0);
-    const [cineFps, setCineFps] = useState(20);
+    const [cineFps] = useState(20);
+
+    // ── Segmentation Mask Overlay State ────────────────────────────────────────
+    const [selectedMaskType, setSelectedMaskType] = useState('none'); // 'none' | 'gt' | 'ai'
+    const [maskOpacity, setMaskOpacity] = useState(0.5);
+
+    // ── Multi-Scan / Patient Folder Series State ──────────────────────────────
+    const [seriesList, setSeriesList] = useState([]);
+    const [activeSeriesId, setActiveSeriesId] = useState(null);
+    const [showSeriesBrowser, setShowSeriesBrowser] = useState(true);
+    const [patientStudyName, setPatientStudyName] = useState('Patient Study');
 
     // ── Viewer Controls ────────────────────────────────────────────────────────
     const [windowCenter, setWindowCenter] = useState(0);
@@ -52,6 +72,7 @@ export default function MedicalViewer() {
     const [isSplitView, setIsSplitView] = useState(false);
     const [clinicalData, setClinicalData] = useState(null);
     const [showClinicalPanel, setShowClinicalPanel] = useState(true);
+    const handleCloseClinicalPanel = useCallback(() => setShowClinicalPanel(false), []);
     const [isLoadingLocalizer, setIsLoadingLocalizer] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
@@ -61,19 +82,25 @@ export default function MedicalViewer() {
     const [mousePos, setMousePos] = useState({ x: 0, y: 0, value: 'N/A' });
     const [isPlayingCine, setIsPlayingCine] = useState(false);
     const [isDragOver, setIsDragOver] = useState(false);
+    const [isUploadMenuOpen, setIsUploadMenuOpen] = useState(false);
 
     // ── Refs ───────────────────────────────────────────────────────────────────
     const origCanvasRef = useRef(null);
     const locCanvasRef = useRef(null);
     const fileInputRef = useRef(null);
+    const folderInputRef = useRef(null);
     const downloadMenuRef = useRef(null);
+    const uploadMenuRef = useRef(null);
     const containerRef = useRef(null);
 
-    // ── Click Outside Listener for Download Menu ─────────────────────────────
+    // ── Click Outside Listener for Menus ──────────────────────────────────────
     useEffect(() => {
         const handleClickOutside = (e) => {
             if (downloadMenuRef.current && !downloadMenuRef.current.contains(e.target)) {
                 setIsDownloadMenuOpen(false);
+            }
+            if (uploadMenuRef.current && !uploadMenuRef.current.contains(e.target)) {
+                setIsUploadMenuOpen(false);
             }
         };
         document.addEventListener('mousedown', handleClickOutside);
@@ -87,9 +114,17 @@ export default function MedicalViewer() {
             .catch(() => setBackendStatus('offline'));
     }, []);
 
-    // ── Cine Loop Animation (Supports 4D Time-Frames & 3D Slices) ──────────────
+    // ── Helper: Detect if current scan is a Cardiac Cine sequence ────────────
+    const currentSeriesObj = seriesList.find((s) => s.id === activeSeriesId) || null;
+    const isCineImage = Boolean(
+        (parsedOriginal?.numTimeFrames || 1) > 1 ||
+        (rawFile?.name && /cine/i.test(rawFile.name)) ||
+        (currentSeriesObj?.filename && /cine/i.test(currentSeriesObj.filename))
+    );
+
+    // ── Cine Loop Animation (Runs only for Cine sequences) ─────────────────────
     useEffect(() => {
-        if (!isPlayingCine || !parsedOriginal) return;
+        if (!isPlayingCine || !parsedOriginal || !isCineImage) return;
 
         const is4DCine = (parsedOriginal.numTimeFrames || 1) > 1;
         const totalSteps = is4DCine ? parsedOriginal.numTimeFrames : parsedOriginal.numSlices;
@@ -105,72 +140,265 @@ export default function MedicalViewer() {
         }, intervalMs);
 
         return () => clearInterval(timer);
-    }, [isPlayingCine, parsedOriginal, cineFps]);
+    }, [isPlayingCine, parsedOriginal, isCineImage, cineFps]);
 
-    // ── File Processing ────────────────────────────────────────────────────────
-    const processUploadedFile = async (file) => {
-        if (!file) return;
-        setErrorMessage('');
-        setStatusMessage(`Loading ${file.name}...`);
-        setRawFile(file);
-        setParsedLocalized(null);
-        setIsSplitView(false);
+    // ── Helper: Extract all files recursively (handles directories & multiple files) ──
+    const extractFilesFromDataTransfer = async (dataTransfer) => {
+        const files = [];
+        if (dataTransfer.items && dataTransfer.items.length > 0) {
+            const queue = [];
+            for (let i = 0; i < dataTransfer.items.length; i++) {
+                const item = dataTransfer.items[i];
+                if (item.webkitGetAsEntry) {
+                    const entry = item.webkitGetAsEntry();
+                    if (entry) queue.push(entry);
+                } else if (item.kind === 'file') {
+                    const f = item.getAsFile();
+                    if (f) files.push(f);
+                }
+            }
+
+            while (queue.length > 0) {
+                const entry = queue.shift();
+                if (entry.isFile) {
+                    const f = await new Promise((resolve) => entry.file(resolve));
+                    if (f) files.push(f);
+                } else if (entry.isDirectory) {
+                    const dirReader = entry.createReader();
+                    const entries = await new Promise((resolve) => {
+                        dirReader.readEntries(resolve, () => resolve([]));
+                    });
+                    for (const child of entries) {
+                        queue.push(child);
+                    }
+                }
+            }
+        } else if (dataTransfer.files && dataTransfer.files.length > 0) {
+            for (let i = 0; i < dataTransfer.files.length; i++) {
+                files.push(dataTransfer.files[i]);
+            }
+        }
+        return files;
+    };
+
+    // ── Select an Active Series from the Browser ──────────────────────────────
+    const selectSeries = (series) => {
+        if (!series) return;
+        setActiveSeriesId(series.id);
+        setRawFile(series.file);
+        setParsedOriginal(series.parsed);
+        setCurrentSlice(0);
+        setCurrentTimeFrame(0);
+        setWindowCenter(series.parsed.defaultWindowCenter);
+        setWindowWidth(series.parsed.defaultWindowWidth);
+        setZoom(1);
+        setPan({ x: 0, y: 0 });
         setIsPlayingCine(false);
 
-        try {
-            const buffer = await file.arrayBuffer();
-            const parsed = await parseMedicalFile(buffer, file.name);
-            setParsedOriginal(parsed);
-            setCurrentSlice(0);
-            setCurrentTimeFrame(0);
-            setWindowCenter(parsed.defaultWindowCenter);
-            setWindowWidth(parsed.defaultWindowWidth);
-            setZoom(1);
-            setPan({ x: 0, y: 0 });
-            setStatusMessage(`Successfully loaded ${file.name} (${parsed.type.toUpperCase()})`);
+        // Restore cached localized view if available
+        if (series.localizedResult) {
+            setParsedLocalized(series.localizedResult.parsed);
+            setLocalizedRawData(series.localizedResult.raw);
+            setIsSplitView(true);
+        } else {
+            setParsedLocalized(null);
+            setLocalizedRawData(null);
+            setIsSplitView(false);
+        }
 
-            // Also upload metadata and fetch patient clinical profile
-            if (parsed.type === 'dicom') {
-                uploadDicom(file).then(res => {
-                    console.log("[MedicalViewer] DICOM upload result:", res);
-                    if (res && res.clinical_data) {
-                        setClinicalData(res.clinical_data);
-                        setShowClinicalPanel(true);
-                    }
-                }).catch(console.warn);
-            } else {
-                uploadNifti(file).then(res => {
-                    console.log("[MedicalViewer] NIfTI upload result:", res);
-                    if (res && res.clinical_data) {
-                        setClinicalData(res.clinical_data);
-                        setShowClinicalPanel(true);
-                    }
-                }).catch(console.warn);
-            }
-        } catch (err) {
-            console.error('Error parsing file:', err);
-            setErrorMessage(`Failed to parse file: ${err.message}`);
-            setStatusMessage('');
+        // Auto-adjust mask selection when switching scans
+        if (selectedMaskType === 'gt' && !series.hasGtMask && !series.gtMask) {
+            setSelectedMaskType('none');
+        }
+
+        setStatusMessage(`Active scan: ${series.filename} (${series.viewType || series.parsed.type.toUpperCase()})`);
+
+        // Preserve patient profile across series of the same patient study without re-rendering or flickering
+        if (series.clinicalData) {
+            setClinicalData((prev) => (prev === series.clinicalData ? prev : series.clinicalData));
+        } else {
+            // Inherit already-loaded study clinical data if available
+            setClinicalData((prev) => {
+                if (prev) {
+                    series.clinicalData = prev;
+                    return prev;
+                }
+                // If not yet loaded for this study, fetch once
+                const uploader = series.parsed.type === 'dicom' ? uploadDicom : uploadNifti;
+                uploader(series.file)
+                    .then((res) => {
+                        if (res && res.clinical_data) {
+                            series.clinicalData = res.clinical_data;
+                            setClinicalData((current) => current || res.clinical_data);
+                        }
+                    })
+                    .catch(console.warn);
+                return prev;
+            });
         }
     };
 
-    const handleFileChange = (e) => {
-        const file = e.target.files[0];
-        if (file) processUploadedFile(file);
+    // ── Batch & Folder Files Processing ────────────────────────────────────────
+    const processUploadedFiles = async (fileList) => {
+        if (!fileList || fileList.length === 0) return;
+        setErrorMessage('');
+        setClinicalData(null);
+
+        const filesArray = Array.from(fileList);
+        const medicalFiles = filesArray.filter((f) => {
+            const name = f.name.toLowerCase();
+            return (
+                name.endsWith('.nii') ||
+                name.endsWith('.nii.gz') ||
+                name.endsWith('.dcm') ||
+                name.endsWith('.dicom')
+            );
+        });
+
+        if (medicalFiles.length === 0) {
+            setErrorMessage('No valid medical files (.nii, .nii.gz, .dcm) found in the selected folder/files.');
+            return;
+        }
+
+        // Sort files naturally by name
+        medicalFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+
+        setStatusMessage(`Parsing ${medicalFiles.length} scan${medicalFiles.length > 1 ? 's' : ''}...`);
+
+        // Detect study / patient folder name
+        const firstFile = medicalFiles[0];
+        let detectedPatient = 'Patient Study';
+        if (firstFile.webkitRelativePath && firstFile.webkitRelativePath.includes('/')) {
+            detectedPatient = firstFile.webkitRelativePath.split('/')[0];
+        } else {
+            const match = firstFile.name.match(/^([A-Za-z0-9_]+?)(?:_SA|_LA|_2CH|_4CH|_LGE|_CINE|\.nii|\.dcm)/i);
+            if (match && match[1]) {
+                detectedPatient = `Patient ${match[1].replace(/_/g, ' ')}`;
+            } else {
+                detectedPatient = firstFile.name.replace(/\.[^/.]+$/, '');
+            }
+        }
+        setPatientStudyName(detectedPatient);
+
+        const newSeries = [];
+        for (let i = 0; i < medicalFiles.length; i++) {
+            const file = medicalFiles[i];
+            try {
+                const buffer = await file.arrayBuffer();
+                const parsed = await parseMedicalFile(buffer, file.name);
+                const thumb = generateThumbnailUrl(parsed);
+                const seq = getSequenceFriendlyName(file.name);
+                newSeries.push({
+                    id: `${file.name}_${file.size}_${i}`,
+                    file,
+                    filename: file.name,
+                    parsed,
+                    thumbnailUrl: thumb,
+                    numSlices: parsed.numSlices,
+                    numTimeFrames: parsed.numTimeFrames,
+                    cols: parsed.cols,
+                    rows: parsed.rows,
+                    type: parsed.type,
+                    viewType: seq.name,
+                    hasLocalization: false,
+                    localizedResult: null
+                });
+            } catch (err) {
+                console.warn(`Error parsing ${file.name}:`, err);
+            }
+        }
+
+        // Link Ground Truth masks to matching anatomical scans
+        const maskMap = new Map();
+        for (const s of newSeries) {
+            if (isGroundTruthMask(s.filename)) {
+                const base = getBaseScanName(s.filename).toLowerCase();
+                maskMap.set(base, s);
+                s.isGroundTruth = true;
+            }
+        }
+
+        for (const s of newSeries) {
+            if (!isGroundTruthMask(s.filename)) {
+                const base = getBaseScanName(s.filename).toLowerCase();
+                if (maskMap.has(base)) {
+                    const matchedGt = maskMap.get(base);
+                    s.gtMask = matchedGt;
+                    s.hasGtMask = true;
+                }
+            }
+        }
+
+        if (newSeries.length === 0) {
+            setErrorMessage('Failed to parse the selected medical scans.');
+            setStatusMessage('');
+            return;
+        }
+
+        // Auto-select the first anatomical scan so user starts on image rather than an isolated mask
+        const firstAnatomical = newSeries.find((s) => !isGroundTruthMask(s.filename)) || newSeries[0];
+
+        // Refine patient/study name if authoritative DICOM tags exist
+        const firstDicom = newSeries.find((s) => s.type === 'dicom');
+        if (firstDicom && firstDicom.parsed?.metadata?.PatientName && firstDicom.parsed.metadata.PatientName !== 'Anonymous' && firstDicom.parsed.metadata.PatientName !== 'N/A') {
+            detectedPatient = firstDicom.parsed.metadata.PatientName.replace(/\^/g, ' ').trim();
+        } else if (firstDicom && firstDicom.parsed?.metadata?.StudyDescription && firstDicom.parsed.metadata.StudyDescription !== 'N/A') {
+            detectedPatient = firstDicom.parsed.metadata.StudyDescription.trim();
+        }
+        setPatientStudyName(detectedPatient);
+
+        setSeriesList(newSeries);
+        setShowSeriesBrowser(true);
+        selectSeries(firstAnatomical);
+        setStatusMessage(`Loaded ${newSeries.length} scans for ${detectedPatient}`);
     };
 
-    const handleDrop = (e) => {
+    const handleFileChange = (e) => {
+        const files = e.target.files;
+        if (files && files.length > 0) processUploadedFiles(files);
+    };
+
+    const handleFolderChange = (e) => {
+        const files = e.target.files;
+        if (files && files.length > 0) processUploadedFiles(files);
+    };
+
+    const handleDrop = async (e) => {
         e.preventDefault();
         setIsDragOver(false);
-        const file = e.dataTransfer.files[0];
-        if (file) processUploadedFile(file);
+
+        try {
+            const files = await extractFilesFromDataTransfer(e.dataTransfer);
+            if (files && files.length > 0) {
+                processUploadedFiles(files);
+            }
+        } catch (err) {
+            console.error('Error handling dropped files:', err);
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                processUploadedFiles(e.dataTransfer.files);
+            }
+        }
     };
+
+    const activeGtMask = currentSeriesObj?.gtMask || null;
+    const hasMatchingGt = Boolean(activeGtMask || currentSeriesObj?.hasGtMask);
 
     // ── Render Canvases ────────────────────────────────────────────────────────
     const renderViews = useCallback(() => {
         if (!parsedOriginal) return;
 
-        // Render Original Canvas (using spatial slice and cardiac time-frame)
+        // Determine which mask overlay (if any) to render
+        let currentMaskData = null;
+        let maskPalette = 'groundTruth';
+
+        if (selectedMaskType === 'gt' && activeGtMask && activeGtMask.parsed) {
+            const mSlice = Math.min(currentSlice, (activeGtMask.parsed.numSlices || 1) - 1);
+            const mTime = Math.min(currentTimeFrame, (activeGtMask.parsed.numTimeFrames || 1) - 1);
+            currentMaskData = activeGtMask.parsed.getSliceData(mSlice, mTime);
+            maskPalette = 'groundTruth';
+        }
+
+        // Render Original Canvas (using spatial slice, cardiac time-frame, and optional mask overlay)
         const origSliceData = parsedOriginal.getSliceData(currentSlice, currentTimeFrame);
         if (origCanvasRef.current && origSliceData) {
             renderSliceToCanvas(
@@ -181,7 +409,10 @@ export default function MedicalViewer() {
                 windowCenter,
                 windowWidth,
                 parsedOriginal.min,
-                parsedOriginal.max
+                parsedOriginal.max,
+                currentMaskData,
+                maskOpacity,
+                maskPalette
             );
         }
 
@@ -209,7 +440,18 @@ export default function MedicalViewer() {
             }
         }
 
-    }, [parsedOriginal, parsedLocalized, isSplitView, currentSlice, currentTimeFrame, windowCenter, windowWidth]);
+    }, [
+        parsedOriginal,
+        parsedLocalized,
+        isSplitView,
+        currentSlice,
+        currentTimeFrame,
+        windowCenter,
+        windowWidth,
+        selectedMaskType,
+        maskOpacity,
+        activeGtMask
+    ]);
 
     useEffect(() => {
         renderViews();
@@ -237,23 +479,39 @@ export default function MedicalViewer() {
 
         try {
             let res;
+            let parsedLoc;
+            let rawData;
             if (parsedOriginal.type === 'dicom') {
                 res = await localizeDicom(rawFile);
                 if (!res.dicom_file_data) throw new Error('No DICOM data in localizer response.');
                 const locBuffer = base64ToArrayBuffer(res.dicom_file_data);
-                const parsedLoc = await parseMedicalFile(locBuffer, `localized_${rawFile.name}`);
-                setLocalizedRawData({ base64: res.dicom_file_data, format: 'dicom' });
-                setIsSplitView(true);
-                setParsedLocalized(parsedLoc);
+                parsedLoc = await parseMedicalFile(locBuffer, `localized_${rawFile.name}`);
+                rawData = { base64: res.dicom_file_data, format: 'dicom' };
             } else {
                 res = await localizeNifti(rawFile);
                 if (!res.nifti_file_data) throw new Error('No NIfTI data in localizer response.');
                 const locBuffer = base64ToArrayBuffer(res.nifti_file_data);
-                const parsedLoc = await parseMedicalFile(locBuffer, `localized_${rawFile.name}`);
-                setLocalizedRawData({ base64: res.nifti_file_data, format: 'nifti' });
-                setIsSplitView(true);
-                setParsedLocalized(parsedLoc);
+                parsedLoc = await parseMedicalFile(locBuffer, `localized_${rawFile.name}`);
+                rawData = { base64: res.nifti_file_data, format: 'nifti' };
             }
+
+            setLocalizedRawData(rawData);
+            setIsSplitView(true);
+            setParsedLocalized(parsedLoc);
+
+            // Cache localization result into seriesList for this series
+            setSeriesList((prevList) =>
+                prevList.map((s) => {
+                    if (s.id === activeSeriesId) {
+                        return {
+                            ...s,
+                            hasLocalization: true,
+                            localizedResult: { parsed: parsedLoc, raw: rawData }
+                        };
+                    }
+                    return s;
+                })
+            );
 
             setStatusMessage('Localization complete! Displaying Real vs Localized view.');
         } catch (err) {
@@ -426,83 +684,161 @@ export default function MedicalViewer() {
             </header>
 
             {/* ── CONTROL TOOLBAR ───────────────────────────────────────────────── */}
-            <div className="h-14 bg-[#0d1420] border-b border-slate-800/80 px-4 flex items-center justify-between text-xs relative z-30 shadow-md">
-                <div className="flex items-center space-x-2.5">
-                    {/* Upload File Button */}
+            <div className="h-14 bg-[#0d1420] border-b border-slate-800/80 px-4 flex items-center justify-between text-xs relative z-40 shadow-md gap-3 select-none">
+                {/* Left Controls Group */}
+                <div className="flex items-center space-x-2 flex-shrink-0">
+                    {/* Hidden Inputs for Files and Folders */}
                     <input
                         type="file"
                         ref={fileInputRef}
                         onChange={handleFileChange}
                         accept=".dcm,.dicom,.nii,.nii.gz"
+                        multiple
                         className="hidden"
                     />
-                    <button
-                        onClick={() => fileInputRef.current?.click()}
-                        className="flex items-center space-x-2 bg-gradient-to-r from-cyan-600 via-cyan-500 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white px-3.5 py-1.5 rounded-lg shadow-md font-semibold transition transform active:scale-95 cursor-pointer ring-1 ring-cyan-400/30"
-                    >
-                        <Upload className="w-4 h-4 text-cyan-100" />
-                        <span>Upload Scan (DICOM / NIfTI)</span>
-                    </button>
+                    <input
+                        type="file"
+                        ref={folderInputRef}
+                        onChange={handleFolderChange}
+                        webkitdirectory="true"
+                        directory=""
+                        multiple
+                        className="hidden"
+                    />
 
-                    <div className="h-6 w-px bg-slate-800 mx-1" />
+                    {/* Consolidated Upload Dropdown */}
+                    <div ref={uploadMenuRef} className="relative z-50 flex-shrink-0">
+                        <button
+                            onClick={() => setIsUploadMenuOpen((prev) => !prev)}
+                            className="flex items-center space-x-1.5 bg-gradient-to-r from-cyan-600 via-cyan-500 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white px-3 py-1.5 rounded-lg shadow-md font-semibold transition transform active:scale-95 cursor-pointer ring-1 ring-cyan-400/30 whitespace-nowrap"
+                            title="Upload Cardiac MRI Scans or Patient Folders"
+                        >
+                            <Upload className="w-3.5 h-3.5 text-cyan-100" />
+                            <span>Upload</span>
+                            <ChevronDown className={`w-3.5 h-3.5 opacity-80 transition-transform ${isUploadMenuOpen ? 'rotate-180' : ''}`} />
+                        </button>
+
+                        {isUploadMenuOpen && (
+                            <div className="absolute top-full left-0 mt-2 w-56 bg-[#0c131d] border border-cyan-500/50 rounded-xl shadow-2xl z-50 py-1.5 text-xs backdrop-blur-xl ring-1 ring-cyan-500/30">
+                                <button
+                                    onClick={() => {
+                                        setIsUploadMenuOpen(false);
+                                        fileInputRef.current?.click();
+                                    }}
+                                    className="w-full text-left px-3.5 py-2.5 text-slate-200 hover:bg-cyan-950 hover:text-cyan-300 flex items-center space-x-2.5 transition font-medium border-b border-slate-800/80 cursor-pointer"
+                                >
+                                    <Upload className="w-4 h-4 text-cyan-400 flex-shrink-0" />
+                                    <div>
+                                        <div className="font-semibold text-white">Upload Scan(s)</div>
+                                        <div className="text-[10px] text-slate-400">Single or multiple .nii, .dcm</div>
+                                    </div>
+                                </button>
+                                <button
+                                    onClick={() => {
+                                        setIsUploadMenuOpen(false);
+                                        folderInputRef.current?.click();
+                                    }}
+                                    className="w-full text-left px-3.5 py-2.5 text-slate-200 hover:bg-amber-950/60 hover:text-amber-300 flex items-center space-x-2.5 transition font-medium cursor-pointer"
+                                >
+                                    <FolderOpen className="w-4 h-4 text-amber-400 flex-shrink-0" />
+                                    <div>
+                                        <div className="font-semibold text-amber-200">Upload Patient Folder</div>
+                                        <div className="text-[10px] text-slate-400">Multi-series & views</div>
+                                    </div>
+                                </button>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Series Explorer Toggle Button */}
+                    {seriesList.length > 0 && (
+                        <button
+                            onClick={() => setShowSeriesBrowser(!showSeriesBrowser)}
+                            className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg font-semibold border transition flex-shrink-0 whitespace-nowrap cursor-pointer ${
+                                showSeriesBrowser
+                                    ? 'bg-cyan-950 text-cyan-300 border-cyan-500/80 shadow-md ring-1 ring-cyan-500/40'
+                                    : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800 hover:text-white'
+                            }`}
+                            title="Toggle Studies & Series Explorer (Bottom Filmstrip)"
+                        >
+                            <Layers className="w-3.5 h-3.5 text-cyan-400" />
+                            <span>Series</span>
+                            <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-cyan-500 text-black font-extrabold">
+                                {seriesList.length}
+                            </span>
+                        </button>
+                    )}
+
+                    <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
 
                     {/* Send to Localizer Button */}
                     <button
                         onClick={handleSendToLocalizer}
                         disabled={!parsedOriginal || isLoadingLocalizer}
-                        className={`flex items-center space-x-2 px-4 py-1.5 rounded-lg font-bold transition shadow-lg active:scale-95 ${
+                        className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg font-bold transition shadow-lg active:scale-95 flex-shrink-0 whitespace-nowrap cursor-pointer ${
                             !parsedOriginal || isLoadingLocalizer
                                 ? 'bg-slate-900 text-slate-500 cursor-not-allowed border border-slate-800'
                                 : 'bg-gradient-to-r from-emerald-600 via-teal-500 to-emerald-500 hover:from-emerald-500 hover:to-teal-400 text-white ring-2 ring-emerald-400/40 glow-emerald'
                         }`}
+                        title="Run Deep Learning Left Ventricle Localizer"
                     >
                         {isLoadingLocalizer ? (
                             <>
-                                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                                <span>Localizing LV ROI...</span>
+                                <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                                <span>Localizing ROI...</span>
                             </>
                         ) : (
                             <>
-                                <Zap className="w-4 h-4 fill-amber-300 text-amber-300" />
+                                <Zap className="w-3.5 h-3.5 fill-amber-300 text-amber-300" />
                                 <span>Run Localizer</span>
                             </>
                         )}
                     </button>
 
-                    <div className="h-6 w-px bg-slate-800 mx-1" />
+                    <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
 
-                    {/* View Modes */}
-                    <div className="flex items-center bg-slate-900/90 p-1 rounded-lg border border-slate-800 space-x-1">
+                    {/* View Modes Toggle */}
+                    <div className="flex items-center bg-slate-900/90 p-1 rounded-lg border border-slate-800 space-x-1 flex-shrink-0 whitespace-nowrap">
                         <button
                             onClick={() => setIsSplitView(false)}
                             disabled={!parsedOriginal}
-                            className={`flex items-center space-x-1.5 px-3 py-1 rounded-md font-medium transition ${!isSplitView ? 'bg-cyan-950 text-cyan-300 border border-cyan-700/60 shadow-sm' : 'text-slate-400 hover:text-slate-200'} ${!parsedOriginal ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-md font-medium transition whitespace-nowrap cursor-pointer ${
+                                !isSplitView
+                                    ? 'bg-cyan-950 text-cyan-300 border border-cyan-700/60 shadow-sm'
+                                    : 'text-slate-400 hover:text-slate-200'
+                            } ${!parsedOriginal ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            title="Single Viewport Mode"
                         >
                             <Square className="w-3.5 h-3.5" />
-                            <span>Single View</span>
+                            <span>Single</span>
                         </button>
 
                         <button
                             onClick={() => setIsSplitView(true)}
                             disabled={!parsedLocalized}
-                            className={`flex items-center space-x-1.5 px-3 py-1 rounded-md font-medium transition ${isSplitView ? 'bg-cyan-950 text-cyan-300 border border-cyan-700/60 shadow-sm' : 'text-slate-400 hover:text-slate-200'} ${!parsedLocalized ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-md font-medium transition whitespace-nowrap cursor-pointer ${
+                                isSplitView
+                                    ? 'bg-cyan-950 text-cyan-300 border border-cyan-700/60 shadow-sm'
+                                    : 'text-slate-400 hover:text-slate-200'
+                            } ${!parsedLocalized ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            title={parsedLocalized ? "Split View (1×2) - Original vs Localized ROI" : "Run Localizer to enable Split View"}
                         >
                             <Columns className="w-3.5 h-3.5" />
-                            <span>Split View (1×2)</span>
+                            <span>Split 1×2</span>
                         </button>
                     </div>
 
                     {/* Download Localized Result Button */}
                     {parsedLocalized && (
-                        <div ref={downloadMenuRef} className="relative z-50">
+                        <div ref={downloadMenuRef} className="relative z-50 flex-shrink-0">
                             <button
                                 onClick={() => setIsDownloadMenuOpen(!isDownloadMenuOpen)}
-                                className="flex items-center space-x-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white px-3.5 py-1.5 rounded-lg font-semibold text-xs shadow-lg transition active:scale-95 cursor-pointer ring-1 ring-emerald-400/40"
+                                className="flex items-center space-x-1 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white px-2.5 py-1.5 rounded-lg font-semibold text-xs shadow-lg transition active:scale-95 cursor-pointer ring-1 ring-emerald-400/40 whitespace-nowrap"
                                 title="Download Localized Output"
                             >
                                 <Download className="w-3.5 h-3.5" />
-                                <span>Download Localized</span>
-                                <ChevronDown className="w-3.5 h-3.5 ml-0.5 opacity-80" />
+                                <span>Export</span>
+                                <ChevronDown className="w-3 h-3 ml-0.5 opacity-80" />
                             </button>
 
                             {isDownloadMenuOpen && (
@@ -535,14 +871,54 @@ export default function MedicalViewer() {
                             )}
                         </div>
                     )}
+
+                    {/* ── GROUND TRUTH MASK OVERLAY CONTROLS (Only visible if a matching GT mask exists) ── */}
+                    {hasMatchingGt && (
+                        <>
+                            <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
+                            <div className="flex items-center bg-slate-900/90 p-1 rounded-lg border border-slate-800 space-x-1.5 flex-shrink-0 whitespace-nowrap">
+                                <button
+                                    onClick={() => setSelectedMaskType((prev) => (prev === 'gt' ? 'none' : 'gt'))}
+                                    className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
+                                        selectedMaskType === 'gt'
+                                            ? 'bg-emerald-950 text-emerald-300 border border-emerald-600/70 shadow-sm'
+                                            : 'text-slate-400 hover:text-slate-200'
+                                    }`}
+                                    title={selectedMaskType === 'gt' ? "Hide Ground Truth Mask Overlay" : "Show Ground Truth Mask Overlay"}
+                                >
+                                    <ShieldCheck className={`w-3.5 h-3.5 ${selectedMaskType === 'gt' ? 'text-emerald-400' : 'text-slate-500'}`} />
+                                    <span>{selectedMaskType === 'gt' ? 'GT Mask: ON' : 'Show GT Mask'}</span>
+                                </button>
+
+                                {selectedMaskType === 'gt' && (
+                                    <div className="flex items-center space-x-1.5 pl-1.5 pr-1 border-l border-slate-800">
+                                        <input
+                                            type="range"
+                                            min="0.1"
+                                            max="0.9"
+                                            step="0.05"
+                                            value={maskOpacity}
+                                            onChange={(e) => setMaskOpacity(Number(e.target.value))}
+                                            className="w-12 accent-emerald-400 h-1 bg-slate-800 rounded cursor-pointer"
+                                            title={`Mask Opacity: ${Math.round(maskOpacity * 100)}%`}
+                                        />
+                                        <span className="text-[10px] text-slate-400 font-mono w-6 text-right">
+                                            {Math.round(maskOpacity * 100)}%
+                                        </span>
+                                    </div>
+                                )}
+                            </div>
+                        </>
+                    )}
                 </div>
 
-                {/* Navigation Tools */}
-                <div className="flex items-center space-x-2">
-                    <div className="flex items-center bg-slate-900/90 p-1 rounded-lg border border-slate-800 space-x-1">
+                {/* Right Controls Group */}
+                <div className="flex items-center space-x-2 flex-shrink-0 whitespace-nowrap">
+                    {/* Interactive Tools (Pan, Zoom, Window) */}
+                    <div className="flex items-center bg-slate-900/90 p-1 rounded-lg border border-slate-800 space-x-1 flex-shrink-0">
                         <button
                             onClick={() => setActiveTool('pan')}
-                            className={`p-1.5 rounded-md transition ${activeTool === 'pan' ? 'bg-cyan-900/70 text-cyan-300 border border-cyan-600/80 shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
+                            className={`p-1.5 rounded-md transition cursor-pointer ${activeTool === 'pan' ? 'bg-cyan-900/70 text-cyan-300 border border-cyan-600/80 shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
                             title="Pan Tool (Click and drag to position image)"
                         >
                             <Move className="w-4 h-4" />
@@ -550,7 +926,7 @@ export default function MedicalViewer() {
 
                         <button
                             onClick={() => setActiveTool('zoom')}
-                            className={`p-1.5 rounded-md transition ${activeTool === 'zoom' ? 'bg-cyan-900/70 text-cyan-300 border border-cyan-600/80 shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
+                            className={`p-1.5 rounded-md transition cursor-pointer ${activeTool === 'zoom' ? 'bg-cyan-900/70 text-cyan-300 border border-cyan-600/80 shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
                             title="Interactive Zoom Tool (Drag up/down or scroll wheel to zoom)"
                         >
                             <Search className="w-4 h-4" />
@@ -558,20 +934,21 @@ export default function MedicalViewer() {
 
                         <button
                             onClick={() => setActiveTool('window')}
-                            className={`p-1.5 rounded-md transition ${activeTool === 'window' ? 'bg-cyan-900/70 text-cyan-300 border border-cyan-600/80 shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
+                            className={`p-1.5 rounded-md transition cursor-pointer ${activeTool === 'window' ? 'bg-cyan-900/70 text-cyan-300 border border-cyan-600/80 shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
                             title="Window / Level (Adjust brightness and contrast)"
                         >
                             <Sun className="w-4 h-4" />
                         </button>
                     </div>
 
-                    <div className="h-6 w-px bg-slate-800 mx-1" />
+                    <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
 
-                    <div className="flex items-center space-x-1">
+                    {/* Zoom & Reset Buttons */}
+                    <div className="flex items-center space-x-1 flex-shrink-0">
                         <button
                             onClick={handleZoomIn}
                             disabled={!parsedOriginal}
-                            className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-cyan-300 disabled:opacity-40 transition"
+                            className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-cyan-300 disabled:opacity-40 transition cursor-pointer"
                             title="Zoom In (+25%)"
                         >
                             <ZoomIn className="w-4 h-4" />
@@ -580,7 +957,7 @@ export default function MedicalViewer() {
                         <button
                             onClick={handleZoomOut}
                             disabled={!parsedOriginal}
-                            className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-cyan-300 disabled:opacity-40 transition"
+                            className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-cyan-300 disabled:opacity-40 transition cursor-pointer"
                             title="Zoom Out (-20%)"
                         >
                             <ZoomOut className="w-4 h-4" />
@@ -589,20 +966,20 @@ export default function MedicalViewer() {
                         <button
                             onClick={handleResetView}
                             disabled={!parsedOriginal}
-                            className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-cyan-300 disabled:opacity-40 transition"
+                            className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-cyan-300 disabled:opacity-40 transition cursor-pointer"
                             title="Reset Zoom & Contrast"
                         >
                             <RotateCcw className="w-4 h-4" />
                         </button>
                     </div>
 
-                    <div className="h-6 w-px bg-slate-800 mx-1" />
+                    <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
 
-                    {/* Patient Profile & Clinical Labs Button */}
+                    {/* Patient Profile & Metadata */}
                     <button
                         onClick={() => { setShowClinicalPanel(prev => !prev); if (!showClinicalPanel) setShowMetadata(false); }}
                         disabled={!parsedOriginal}
-                        className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border font-medium transition ${
+                        className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border font-medium transition cursor-pointer flex-shrink-0 ${
                             showClinicalPanel
                                 ? 'bg-cyan-600/30 border-cyan-500 text-cyan-300'
                                 : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
@@ -610,13 +987,18 @@ export default function MedicalViewer() {
                         title="Toggle Patient Profile and Clinical Biomarkers"
                     >
                         <Activity className="w-3.5 h-3.5 text-cyan-400" />
-                        <span>Patient Profile</span>
+                        <span>Profile</span>
                     </button>
 
                     <button
                         onClick={() => { setShowMetadata(prev => !prev); if (!showMetadata) setShowClinicalPanel(false); }}
                         disabled={!parsedOriginal}
-                        className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border font-medium transition ${showMetadata ? 'bg-blue-950 text-blue-300 border-blue-700/80 shadow-sm' : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800'} ${!parsedOriginal ? 'opacity-40 cursor-not-allowed' : ''}`}
+                        className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border font-medium transition cursor-pointer flex-shrink-0 ${
+                            showMetadata
+                                ? 'bg-blue-950 text-blue-300 border-blue-700/80 shadow-sm'
+                                : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800'
+                        } ${!parsedOriginal ? 'opacity-40 cursor-not-allowed' : ''}`}
+                        title="Toggle DICOM/NIfTI Header Metadata"
                     >
                         <FileText className="w-3.5 h-3.5 text-blue-400" />
                         <span>Metadata</span>
@@ -648,7 +1030,7 @@ export default function MedicalViewer() {
                     <aside className="w-80 sm:w-96 bg-[#0a0f18] border-r border-slate-800/80 p-3 overflow-y-auto z-20 shadow-2xl flex flex-col">
                         <ClinicalDataPanel
                             clinicalData={clinicalData}
-                            onClose={() => setShowClinicalPanel(false)}
+                            onClose={handleCloseClinicalPanel}
                         />
                     </aside>
                 )}
@@ -706,9 +1088,9 @@ export default function MedicalViewer() {
                             </div>
 
                             <div className="space-y-1">
-                                <h2 className="text-lg font-bold text-slate-100 tracking-wide">Upload Cardiac MRI Scan</h2>
+                                <h2 className="text-lg font-bold text-slate-100 tracking-wide">Cardiac MRI Workstation</h2>
                                 <p className="text-xs text-slate-400">
-                                    Drag & drop your medical imaging file or click below to browse.
+                                    Upload single scans or an entire patient folder containing multiple views (CINE, Short-Axis, 2CH, 4CH, LGE).
                                 </p>
                             </div>
 
@@ -719,12 +1101,23 @@ export default function MedicalViewer() {
                                 <span className="bg-slate-900 border border-slate-800 px-2 py-1 rounded">.NII.GZ</span>
                             </div>
 
-                            <button
-                                onClick={() => fileInputRef.current?.click()}
-                                className="w-full bg-gradient-to-r from-cyan-600 via-blue-600 to-indigo-600 hover:from-cyan-500 hover:to-indigo-500 text-white py-2.5 rounded-xl font-bold text-xs shadow-lg transition active:scale-95 ring-2 ring-cyan-400/30"
-                            >
-                                Select File to View
-                            </button>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
+                                <button
+                                    onClick={() => fileInputRef.current?.click()}
+                                    className="bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white py-2.5 px-3 rounded-xl font-bold text-xs shadow-lg transition active:scale-95 ring-1 ring-cyan-400/30 flex items-center justify-center gap-2"
+                                >
+                                    <Upload className="w-4 h-4" />
+                                    <span>Select Scan(s)</span>
+                                </button>
+
+                                <button
+                                    onClick={() => folderInputRef.current?.click()}
+                                    className="bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white py-2.5 px-3 rounded-xl font-bold text-xs shadow-lg transition active:scale-95 ring-1 ring-amber-400/30 flex items-center justify-center gap-2"
+                                >
+                                    <FolderOpen className="w-4 h-4" />
+                                    <span>Patient Folder</span>
+                                </button>
+                            </div>
                         </div>
                     </div>
                 ) : (
@@ -744,6 +1137,12 @@ export default function MedicalViewer() {
                                 <span className="text-slate-400 text-[10px] bg-slate-800 px-1.5 py-0.5 rounded">
                                     {parsedOriginal.type.toUpperCase()}
                                 </span>
+                                {selectedMaskType === 'gt' && (
+                                    <span className="text-emerald-300 text-[10px] bg-emerald-950/80 border border-emerald-600/60 px-1.5 py-0.5 rounded flex items-center gap-1 font-semibold">
+                                        <ShieldCheck className="w-2.5 h-2.5" />
+                                        GT MASK ON
+                                    </span>
+                                )}
                             </div>
 
                             {/* Viewport Information Overlay (Top Right) */}
@@ -834,53 +1233,157 @@ export default function MedicalViewer() {
                 )}
             </div>
 
-            {/* ── FOOTER SLICE NAVIGATOR BAR ────────────────────────────────────── */}
+            {/* ── FOOTER SLICE / CINE NAVIGATOR BAR ────────────────────────────── */}
             {parsedOriginal && (
                 <footer className="h-12 bg-[#0c131d] border-t border-slate-800/80 px-6 flex items-center justify-between z-20 text-xs shadow-inner">
-                    <div className="flex items-center space-x-4 w-full max-w-3xl mx-auto font-mono">
-                        {/* Cine Playback Button */}
-                        {parsedOriginal.numSlices > 1 && (
+                    <div className="flex items-center space-x-4 w-full max-w-4xl mx-auto font-mono">
+                        {/* Cine Playback Button (available ONLY for Cine images) */}
+                        {isCineImage && (
                             <button
                                 onClick={() => setIsPlayingCine(!isPlayingCine)}
-                                className={`p-1.5 rounded-lg border transition ${isPlayingCine ? 'bg-amber-950 text-amber-300 border-amber-600/80' : 'bg-slate-900 text-slate-300 border-slate-800 hover:text-white'}`}
+                                className={`p-1.5 rounded-lg border transition cursor-pointer ${
+                                    isPlayingCine
+                                        ? 'bg-amber-950 text-amber-300 border-amber-600/80 ring-1 ring-amber-500/50'
+                                        : 'bg-slate-900 text-slate-300 border-slate-800 hover:text-white'
+                                }`}
                                 title={isPlayingCine ? "Pause Cine Loop" : "Play Cine Loop"}
                             >
                                 {isPlayingCine ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
                             </button>
                         )}
 
-                        <button
-                            onClick={() => setCurrentSlice((prev) => Math.max(0, prev - 1))}
-                            disabled={currentSlice === 0}
-                            className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                        >
-                            <ChevronLeft className="w-4 h-4" />
-                        </button>
+                        {/* CASE 1: 2D Cine (1 Slice, Multiple Cardiac Phases e.g. 001_LA_CINE.nii) */}
+                        {(parsedOriginal.numTimeFrames || 1) > 1 && parsedOriginal.numSlices <= 1 && (
+                            <>
+                                <button
+                                    onClick={() => setCurrentTimeFrame((prev) => Math.max(0, prev - 1))}
+                                    disabled={currentTimeFrame === 0}
+                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
+                                    title="Previous Cardiac Phase"
+                                >
+                                    <ChevronLeft className="w-4 h-4" />
+                                </button>
 
-                        <span className="text-slate-300 w-28 text-center font-bold">
-                            Slice {currentSlice + 1} / {parsedOriginal.numSlices}
-                        </span>
+                                <span className="text-amber-300 w-36 text-center font-bold">
+                                    Phase {currentTimeFrame + 1} / {parsedOriginal.numTimeFrames}
+                                </span>
 
-                        <button
-                            onClick={() => setCurrentSlice((prev) => Math.min(parsedOriginal.numSlices - 1, prev + 1))}
-                            disabled={currentSlice === parsedOriginal.numSlices - 1}
-                            className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                        >
-                            <ChevronRight className="w-4 h-4" />
-                        </button>
+                                <button
+                                    onClick={() => setCurrentTimeFrame((prev) => Math.min(parsedOriginal.numTimeFrames - 1, prev + 1))}
+                                    disabled={currentTimeFrame === parsedOriginal.numTimeFrames - 1}
+                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
+                                    title="Next Cardiac Phase"
+                                >
+                                    <ChevronRight className="w-4 h-4" />
+                                </button>
 
-                        {parsedOriginal.numSlices > 1 && (
-                            <input
-                                type="range"
-                                min="0"
-                                max={parsedOriginal.numSlices - 1}
-                                value={currentSlice}
-                                onChange={(e) => setCurrentSlice(Number(e.target.value))}
-                                className="flex-1 accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
-                            />
+                                <input
+                                    type="range"
+                                    min="0"
+                                    max={parsedOriginal.numTimeFrames - 1}
+                                    value={currentTimeFrame}
+                                    onChange={(e) => setCurrentTimeFrame(Number(e.target.value))}
+                                    className="flex-1 accent-amber-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                                />
+                            </>
+                        )}
+
+                        {/* CASE 2: 4D Cine (Multiple Slices AND Multiple Cardiac Phases e.g. 001_SA_CINE.nii) */}
+                        {(parsedOriginal.numTimeFrames || 1) > 1 && parsedOriginal.numSlices > 1 && (
+                            <>
+                                <div className="flex items-center space-x-2">
+                                    <button
+                                        onClick={() => setCurrentSlice((prev) => Math.max(0, prev - 1))}
+                                        disabled={currentSlice === 0}
+                                        className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
+                                    >
+                                        <ChevronLeft className="w-4 h-4" />
+                                    </button>
+                                    <span className="text-cyan-300 w-28 text-center font-bold">
+                                        Slice {currentSlice + 1} / {parsedOriginal.numSlices}
+                                    </span>
+                                    <button
+                                        onClick={() => setCurrentSlice((prev) => Math.min(parsedOriginal.numSlices - 1, prev + 1))}
+                                        disabled={currentSlice === parsedOriginal.numSlices - 1}
+                                        className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
+                                    >
+                                        <ChevronRight className="w-4 h-4" />
+                                    </button>
+                                </div>
+
+                                <div className="h-4 w-px bg-slate-700 mx-1" />
+
+                                <div className="flex items-center space-x-2 flex-1">
+                                    <span className="text-amber-300 font-bold whitespace-nowrap">
+                                        Phase {currentTimeFrame + 1} / {parsedOriginal.numTimeFrames}
+                                    </span>
+                                    <input
+                                        type="range"
+                                        min="0"
+                                        max={parsedOriginal.numTimeFrames - 1}
+                                        value={currentTimeFrame}
+                                        onChange={(e) => setCurrentTimeFrame(Number(e.target.value))}
+                                        className="flex-1 accent-amber-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                                    />
+                                </div>
+                            </>
+                        )}
+
+                        {/* CASE 3: 3D Static Volume (Multiple Slices, 1 Phase e.g. 001_SA_ED.nii or LGE) */}
+                        {(parsedOriginal.numTimeFrames || 1) <= 1 && parsedOriginal.numSlices > 1 && (
+                            <>
+                                <button
+                                    onClick={() => setCurrentSlice((prev) => Math.max(0, prev - 1))}
+                                    disabled={currentSlice === 0}
+                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
+                                >
+                                    <ChevronLeft className="w-4 h-4" />
+                                </button>
+
+                                <span className="text-slate-300 w-28 text-center font-bold">
+                                    Slice {currentSlice + 1} / {parsedOriginal.numSlices}
+                                </span>
+
+                                <button
+                                    onClick={() => setCurrentSlice((prev) => Math.min(parsedOriginal.numSlices - 1, prev + 1))}
+                                    disabled={currentSlice === parsedOriginal.numSlices - 1}
+                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
+                                >
+                                    <ChevronRight className="w-4 h-4" />
+                                </button>
+
+                                <input
+                                    type="range"
+                                    min="0"
+                                    max={parsedOriginal.numSlices - 1}
+                                    value={currentSlice}
+                                    onChange={(e) => setCurrentSlice(Number(e.target.value))}
+                                    className="flex-1 accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                                />
+                            </>
+                        )}
+
+                        {/* CASE 4: 2D Static (1 Slice, 1 Phase) */}
+                        {(parsedOriginal.numTimeFrames || 1) <= 1 && parsedOriginal.numSlices <= 1 && (
+                            <span className="text-slate-400 text-center mx-auto">
+                                Single Frame (2D View)
+                            </span>
                         )}
                     </div>
                 </footer>
+            )}
+
+            {/* ── BOTTOM SERIES FILMSTRIP (All Scans at the Very Bottom) ───────── */}
+            {seriesList.length > 0 && showSeriesBrowser && (
+                <SeriesBrowser
+                    seriesList={seriesList}
+                    activeSeriesId={activeSeriesId}
+                    onSelectSeries={selectSeries}
+                    onOpenFolderUpload={() => folderInputRef.current?.click()}
+                    onOpenFileUpload={() => fileInputRef.current?.click()}
+                    onClose={() => setShowSeriesBrowser(false)}
+                    patientName={patientStudyName}
+                />
             )}
 
             {/* ── KEYBOARD SHORTCUTS HELP MODAL ─────────────────────────────────── */}

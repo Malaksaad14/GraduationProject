@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import {
-    Activity, FileText, ChevronDown, ChevronUp,
-    AlertCircle, CheckCircle, ShieldAlert, Heart,
+    Activity, ChevronDown, ChevronUp,
+    AlertCircle, CheckCircle, Heart,
     Cpu, Tag, FlaskConical, Info
 } from "lucide-react";
 
@@ -59,7 +59,7 @@ const SectionHeader = ({ icon: Icon, title }) => (
 
 // --- main component -----------------------------------------------------------
 
-export default function ClinicalDataPanel({ clinicalData, onClose }) {
+const ClinicalDataPanel = React.memo(function ClinicalDataPanel({ clinicalData, onClose }) {
     const [isCollapsed, setIsCollapsed] = useState(false);
     const [showRaw, setShowRaw] = useState(false);
 
@@ -78,18 +78,32 @@ export default function ClinicalDataPanel({ clinicalData, onClose }) {
     // 2. Record not found in any dataset
     if (!clinicalData.found) {
         return (
-            <div className="bg-[#1a1215] border border-amber-500/40 rounded-xl p-4 text-white text-xs shadow-xl m-2">
-                <div className="flex items-start gap-3">
-                    <ShieldAlert className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
-                    <div>
-                        <div className="font-semibold text-amber-300 mb-1">Clinical Record Notice</div>
-                        <div className="text-gray-300">
-                            {clinicalData.message ||
-                                `No clinical records found for Patient ID: ${clinicalData.patient_id || "Unknown"}`}
+            <div className="bg-[#0b131d] border border-slate-800 rounded-xl overflow-hidden shadow-2xl text-white transition-all duration-300 flex flex-col h-full">
+                <div className="bg-[#11202e] px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                        <Activity className="w-4 h-4 text-[#4aa0ce]" />
+                        <span className="text-xs font-bold uppercase tracking-wider text-[#76c7e8]">
+                            Patient Clinical Profile
+                        </span>
+                    </div>
+                    {onClose && (
+                        <button onClick={onClose} className="text-gray-400 hover:text-red-400 p-1 text-xs">
+                            &#x2715;
+                        </button>
+                    )}
+                </div>
+                <div className="p-4 space-y-3 text-xs">
+                    <div className="bg-[#0f1d2b] border border-cyan-500/20 rounded-lg p-3 text-gray-300 space-y-2">
+                        <div className="flex items-center gap-2 text-cyan-400 font-semibold">
+                            <Info className="w-4 h-4 text-cyan-400 shrink-0" />
+                            <span>Metadata from Image Headers Only</span>
                         </div>
-                        <div className="mt-2 text-[11px] text-gray-400">
-                            The MRI scan is fully ready for localization and segmentation.
-                        </div>
+                        <p className="text-[11px] text-gray-400 leading-relaxed">
+                            {clinicalData.message || "Metadata sourced from DICOM/NIfTI headers only. No external clinical records or lab results attached."}
+                        </p>
+                    </div>
+                    <div className="text-[11px] text-slate-400 bg-slate-900/60 p-2.5 rounded border border-slate-800/80">
+                        Scan is fully loaded and ready for viewport navigation, metadata inspection, and deep learning LV localization.
                     </div>
                 </div>
             </div>
@@ -116,17 +130,33 @@ export default function ClinicalDataPanel({ clinicalData, onClose }) {
 
     // Filtered demographics rows (skip absent fields)
     const extraDemoFields = Object.entries({
+        "Patient Name": demographics.name,
+        "Patient ID": demographics.id,
+        "Age": demographics.age ? `${demographics.age} yrs` : null,
+        "Gender": demographics.gender,
+        "Weight": demographics.weight,
+        "Height": demographics.height,
         "Category": demographics.category,
         "Severity": demographics.severity,
+        "Clinical Notes": demographics.clinical_notes,
     }).filter(([, v]) => hasValue(v));
 
     // Filtered imaging rows
     const imagingFields = Object.entries({
+        "Study / Dataset": imaging_specs.dataset,
         "Modality": imaging_specs.modality,
-        "Dataset": imaging_specs.dataset,
         "Vendor": imaging_specs.vendor,
-        "Scanner": imaging_specs.scanner,
+        "Scanner Model": imaging_specs.scanner,
+        "Station Name": imaging_specs.station,
+        "Institution": imaging_specs.institution,
         "Field Strength": imaging_specs.field_strength,
+        "Series Description": imaging_specs.series_description,
+        "Protocol Name": imaging_specs.protocol_name,
+        "Heart Rate": imaging_specs.heart_rate,
+        "Repetition Time": imaging_specs.repetition_time,
+        "Echo Time": imaging_specs.echo_time,
+        "Flip Angle": imaging_specs.flip_angle,
+        "Study Date": imaging_specs.study_date,
         "Centre": imaging_specs.centre,
         "Slice Gap": imaging_specs.gap_between_slices,
     }).filter(([, v]) => hasValue(v));
@@ -143,11 +173,7 @@ export default function ClinicalDataPanel({ clinicalData, onClose }) {
                     </span>
                 </div>
                 <div className="flex items-center gap-2">
-                    {source && (
-                        <span className="text-[9px] bg-[#1a3348] text-[#4aa0ce] px-2 py-0.5 rounded-full border border-[#4aa0ce]/30 truncate max-w-[120px]" title={source}>
-                            {source}
-                        </span>
-                    )}
+
                     <button
                         onClick={() => setIsCollapsed(!isCollapsed)}
                         className="text-gray-400 hover:text-white p-1 rounded hover:bg-[#1a2f42]"
@@ -166,17 +192,18 @@ export default function ClinicalDataPanel({ clinicalData, onClose }) {
             {!isCollapsed && (
                 <div className="p-4 space-y-4 overflow-y-auto max-h-[calc(100vh-220px)] custom-scrollbar">
 
+
                     {/* Demographics & Diagnosis */}
                     {hasDemo && (
                         <div className="bg-[#0f1d2b] p-3 rounded-lg border border-[#4aa0ce]/30 space-y-2">
                             <div className="flex items-center justify-between border-b border-[#4aa0ce]/20 pb-2">
                                 <div className="flex items-center gap-2">
                                     <div className="w-8 h-8 rounded-full bg-[#1b344d] flex items-center justify-center text-[#76c7e8] font-bold text-[10px]">
-                                        {String(demographics.id || "PT").slice(0, 4)}
+                                        {String(demographics.name || demographics.id || "PT").slice(0, 4)}
                                     </div>
                                     <div>
                                         <div className="text-xs font-semibold text-white">
-                                            Patient #{demographics.id || clinicalData.patient_id}
+                                            {demographics.name ? demographics.name : (demographics.id ? `Patient #${demographics.id}` : (clinicalData.patient_id ? `Patient #${clinicalData.patient_id}` : "Patient Record"))}
                                         </div>
                                         {hasValue(demographics.age) && hasValue(demographics.gender) && (
                                             <div className="text-[11px] text-gray-400">
@@ -320,4 +347,6 @@ export default function ClinicalDataPanel({ clinicalData, onClose }) {
             )}
         </div>
     );
-}
+});
+
+export default ClinicalDataPanel;

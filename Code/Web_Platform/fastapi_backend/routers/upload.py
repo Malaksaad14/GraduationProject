@@ -8,7 +8,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 
 from services.dicom_service import read_dicom_from_bytes, get_pixel_array, save_dicom_file
-from services.clinical_service import extract_patient_id, get_clinical_data
+from services.clinical_service import extract_patient_id, get_clinical_data, extract_clinical_from_dicom
 from config import UPLOAD_DIR
 
 router = APIRouter(prefix="/upload", tags=["Upload"])
@@ -43,9 +43,9 @@ async def upload_dicom(dicom_file: UploadFile = File(...)):
     except Exception:
         pass
 
-    # Extract Patient ID and query clinical dataset
+    # Extract Patient ID and query clinical dataset directly from authoritative DICOM headers
     patient_id = extract_patient_id(dicom_file.filename, ds=ds)
-    clinical_info = get_clinical_data(patient_id)
+    clinical_info = extract_clinical_from_dicom(ds=ds, filename=dicom_file.filename)
 
     def safe_get(tag):
         val = getattr(ds, tag, None)
@@ -118,7 +118,7 @@ async def upload_nifti(nifti_file: UploadFile = File(...)):
 
     # Extract Patient ID (e.g. 001 from 001_SA_CINE.nii) and query clinical dataset
     patient_id = extract_patient_id(nifti_file.filename)
-    clinical_info = get_clinical_data(patient_id)
+    clinical_info = get_clinical_data(patient_id, filename=nifti_file.filename)
 
     return {
         "message": "NIfTI uploaded successfully",
@@ -139,9 +139,9 @@ async def upload_nifti(nifti_file: UploadFile = File(...)):
     }
 
 @router.get("/clinical/{patient_id}", summary="Lookup patient clinical profile and lab results")
-async def lookup_clinical(patient_id: str):
+async def lookup_clinical(patient_id: str, filename: str = ""):
     """Directly fetch patient clinical history and laboratory biomarkers by ID."""
-    info = get_clinical_data(patient_id)
+    info = get_clinical_data(patient_id, filename=filename)
     return JSONResponse(content=info)
 
 @router.post("/extract-metadata", summary="Extract metadata from a DICOM or NIfTI file")
