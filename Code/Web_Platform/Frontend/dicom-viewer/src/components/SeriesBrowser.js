@@ -21,8 +21,14 @@ export function getSequenceFriendlyName(filename = '') {
     if (fn.includes('_GT') || fn.includes('_MASK') || fn.includes('_SEG')) {
         return { name: 'Ground Truth Mask', tag: 'GT', color: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' };
     }
-    if (fn.includes('SA_CINE') || (fn.includes('SA') && fn.includes('CINE'))) {
-        return { name: 'Short Axis (Cine)', tag: 'CINE', color: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' };
+    if (fn.includes('BSSFP') || fn.includes('TRUEFISP') || fn.includes('FIESTA') || fn.includes('SA_CINE') || (fn.includes('SA') && fn.includes('CINE')) || fn.includes('01_BSSFP')) {
+        return { name: 'bSSFP Cine', tag: 'CINE', color: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' };
+    }
+    if (fn.includes('T1') || fn.includes('MOLLI') || fn.includes('SHMOLLI') || fn.includes('SASHA') || fn.includes('02_T1')) {
+        return { name: 'T1 Parametric Map', tag: 'T1', color: 'bg-amber-500/20 text-amber-300 border-amber-500/40' };
+    }
+    if (fn.includes('DENSE') || fn.includes('03_DENSE')) {
+        return { name: 'DENSE Myocardial Strain', tag: 'DENSE', color: 'bg-purple-500/20 text-purple-300 border-purple-500/40' };
     }
     if (fn.includes('LA_2CH') || fn.includes('2CH')) {
         return { name: '2-Chamber View (LA)', tag: '2-CH', color: 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40' };
@@ -33,11 +39,8 @@ export function getSequenceFriendlyName(filename = '') {
     if (fn.includes('LA_3CH') || fn.includes('3CH')) {
         return { name: '3-Chamber View (LA)', tag: '3-CH', color: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40' };
     }
-    if (fn.includes('LGE') || fn.includes('DE_') || fn.includes('INFARCT') || fn.includes('VIAB')) {
+    if (fn.includes('LGE') || fn.includes('DE_') || fn.includes('INFARCT') || fn.includes('VIAB') || fn.includes('PSIR') || fn.includes('MDE')) {
         return { name: 'Late Gadolinium (LGE)', tag: 'LGE', color: 'bg-rose-500/20 text-rose-300 border-rose-500/40' };
-    }
-    if (fn.includes('T1')) {
-        return { name: 'T1 Parametric Map', tag: 'T1', color: 'bg-amber-500/20 text-amber-300 border-amber-500/40' };
     }
     if (fn.includes('T2')) {
         return { name: 'T2 Edema Mapping', tag: 'T2', color: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40' };
@@ -51,7 +54,7 @@ export function getSequenceFriendlyName(filename = '') {
     if (fn.includes('SA') || fn.includes('SHORT')) {
         return { name: 'Short Axis (SA)', tag: 'SA', color: 'bg-slate-500/20 text-slate-300 border-slate-500/40' };
     }
-    return { name: filename.replace(/(\.nii|\.gz|\.dcm|\.dicom)/gi, ''), tag: 'VIEW', color: 'bg-slate-700/30 text-slate-300 border-slate-700/50' };
+    return { name: filename.replace(/(\.nii|\.gz|\.dcm|\.dicom)/gi, '').replace(/^series_/i, ''), tag: 'VIEW', color: 'bg-slate-700/30 text-slate-300 border-slate-700/50' };
 }
 
 export default function SeriesBrowser({
@@ -204,13 +207,25 @@ export default function SeriesBrowser({
                                             {series.numSlices || 1}
                                         </div>
 
-                                        {/* Cine indicator badge (Top-Left) */}
-                                        {(series.numTimeFrames || 1) > 1 && (
+                                        {/* Dynamic Dimensionality indicator badge (Top-Left) */}
+                                        {series.parsed?.isT1Mapping ? (
+                                            <div className="absolute top-1 left-1 bg-amber-500/95 text-black px-1.5 py-0.2 rounded text-[8px] font-mono font-black flex items-center gap-0.5 shadow-md">
+                                                <span>T1 MAP ({series.numTimeFrames} TIs)</span>
+                                            </div>
+                                        ) : series.parsed?.isDense ? (
+                                            <div className="absolute top-1 left-1 bg-purple-500/95 text-white px-1.5 py-0.2 rounded text-[8px] font-mono font-black flex items-center gap-0.5 shadow-md">
+                                                <span>DENSE ({series.numTimeFrames} P)</span>
+                                            </div>
+                                        ) : (series.numTimeFrames || 1) > 1 ? (
                                             <div className="absolute top-1 left-1 bg-amber-500/95 text-black px-1.5 py-0.2 rounded text-[8px] font-mono font-black flex items-center gap-0.5 shadow-md">
                                                 <Play className="w-2 h-2 fill-black" />
-                                                <span>CINE</span>
+                                                <span>CINE ({series.numTimeFrames})</span>
                                             </div>
-                                        )}
+                                        ) : (series.numSlices || 1) > 1 ? (
+                                            <div className="absolute top-1 left-1 bg-cyan-600/95 text-white px-1.5 py-0.2 rounded text-[8px] font-mono font-black flex items-center gap-0.5 shadow-md">
+                                                <span>3D VOL</span>
+                                            </div>
+                                        ) : null}
 
                                         {/* Linked GT Mask indicator */}
                                         {hasLinkedGt && (

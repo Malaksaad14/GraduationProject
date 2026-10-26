@@ -34,7 +34,8 @@ import {
     base64ToArrayBuffer,
     generateThumbnailUrl,
     isGroundTruthMask,
-    getBaseScanName
+    getBaseScanName,
+    groupAndAssembleDicomFiles
 } from '../utils/medicalImageLoader';
 import AIChatbot from './AIChatbot';
 import ClinicalDataPanel from './ClinicalDataPanel';
@@ -47,7 +48,7 @@ export default function MedicalViewer() {
     const [parsedLocalized, setParsedLocalized] = useState(null);
     const [currentSlice, setCurrentSlice] = useState(0);
     const [currentTimeFrame, setCurrentTimeFrame] = useState(0);
-    const [cineFps] = useState(20);
+    const [cineFps, setCineFps] = useState(20);
 
     // ── Segmentation Mask Overlay State ────────────────────────────────────────
     const [selectedMaskType, setSelectedMaskType] = useState('none'); // 'none' | 'gt' | 'ai'
@@ -117,10 +118,14 @@ export default function MedicalViewer() {
     // ── Helper: Detect if current scan is a Cardiac Cine sequence ────────────
     const currentSeriesObj = seriesList.find((s) => s.id === activeSeriesId) || null;
     const isCineImage = Boolean(
-        (parsedOriginal?.numTimeFrames || 1) > 1 ||
-        (rawFile?.name && /cine/i.test(rawFile.name)) ||
-        (currentSeriesObj?.filename && /cine/i.test(currentSeriesObj.filename))
+        parsedOriginal?.isCine ||
+        (!parsedOriginal?.isT1Mapping && !parsedOriginal?.isMultiEcho && (parsedOriginal?.numTimeFrames || 1) > 1) ||
+        (rawFile?.name && /cine|bssfp|truefisp|fiesta|bffe/i.test(rawFile.name)) ||
+        (currentSeriesObj?.filename && /cine|bssfp|truefisp|fiesta|bffe/i.test(currentSeriesObj.filename))
     );
+    const currentFrameMeta = parsedOriginal?.getTimeFrameMeta
+        ? parsedOriginal.getTimeFrameMeta(currentSlice, currentTimeFrame)
+        : null;
 
     // ── Cine Loop Animation (Runs only for Cine sequences) ─────────────────────
     useEffect(() => {
@@ -280,9 +285,27 @@ export default function MedicalViewer() {
         }
         setPatientStudyName(detectedPatient);
 
+        const niftiFiles = medicalFiles.filter((f) => {
+            const name = f.name.toLowerCase();
+            return name.endsWith('.nii') || name.endsWith('.nii.gz');
+        });
+        const dicomFiles = medicalFiles.filter((f) => {
+            const name = f.name.toLowerCase();
+            return name.endsWith('.dcm') || name.endsWith('.dicom');
+        });
+
         const newSeries = [];
-        for (let i = 0; i < medicalFiles.length; i++) {
-            const file = medicalFiles[i];
+
+        // 1. Group & assemble multi-file DICOM series (e.g. 01_bSSFP_Cine, 02_T1_Mapping, etc.)
+        if (dicomFiles.length > 0) {
+            setStatusMessage(`Grouping & assembling ${dicomFiles.length} DICOM files...`);
+            const assembled = await groupAndAssembleDicomFiles(dicomFiles);
+            newSeries.push(...assembled);
+        }
+
+        // 2. Process NIfTI files
+        for (let i = 0; i < niftiFiles.length; i++) {
+            const file = niftiFiles[i];
             try {
                 const buffer = await file.arrayBuffer();
                 const parsed = await parseMedicalFile(buffer, file.name);
@@ -1150,7 +1173,14 @@ export default function MedicalViewer() {
                                 <div>Dim: {parsedOriginal.cols}×{parsedOriginal.rows}</div>
                                 <div>Slice: {currentSlice + 1} / {parsedOriginal.numSlices}</div>
                                 {((parsedOriginal.numTimeFrames || 1) > 1) && (
-                                    <div className="text-emerald-400 font-bold">Phase: {currentTimeFrame + 1} / {parsedOriginal.numTimeFrames} {isPlayingCine ? '• CINE' : ''}</div>
+                                    <div className="text-emerald-400 font-bold">
+                                        {parsedOriginal.isT1Mapping
+                                            ? `TI: ${currentFrameMeta?.inversionTime ? currentFrameMeta.inversionTime : `${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames}`}`
+                                            : parsedOriginal.isDense
+                                            ? `Phase: ${currentTimeFrame + 1} / ${parsedOriginal.numTimeFrames} ${isPlayingCine ? '• PLAY' : ''}`
+                                            : `Phase: ${currentTimeFrame + 1} / ${parsedOriginal.numTimeFrames} ${currentFrameMeta?.triggerTime ? `(${currentFrameMeta.triggerTime})` : ''} ${isPlayingCine ? '• CINE' : ''}`
+                                        }
+                                    </div>
                                 )}
                             </div>
 
@@ -1237,42 +1267,102 @@ export default function MedicalViewer() {
             {parsedOriginal && (
                 <footer className="h-12 bg-[#0c131d] border-t border-slate-800/80 px-6 flex items-center justify-between z-20 text-xs shadow-inner">
                     <div className="flex items-center space-x-4 w-full max-w-4xl mx-auto font-mono">
-                        {/* Cine Playback Button (available ONLY for Cine images) */}
+                        {/* Cine Playback Button & FPS Control (available for Cine sequences) */}
                         {isCineImage && (
-                            <button
-                                onClick={() => setIsPlayingCine(!isPlayingCine)}
-                                className={`p-1.5 rounded-lg border transition cursor-pointer ${
-                                    isPlayingCine
-                                        ? 'bg-amber-950 text-amber-300 border-amber-600/80 ring-1 ring-amber-500/50'
-                                        : 'bg-slate-900 text-slate-300 border-slate-800 hover:text-white'
-                                }`}
-                                title={isPlayingCine ? "Pause Cine Loop" : "Play Cine Loop"}
-                            >
-                                {isPlayingCine ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
-                            </button>
+                            <div className="flex items-center space-x-1.5 bg-slate-900 px-2 py-1 rounded-lg border border-slate-800 flex-shrink-0">
+                                <button
+                                    onClick={() => setIsPlayingCine(!isPlayingCine)}
+                                    className={`p-1 rounded-md transition cursor-pointer ${
+                                        isPlayingCine
+                                            ? 'bg-amber-950 text-amber-300 border border-amber-600/80 ring-1 ring-amber-500/50'
+                                            : 'text-slate-300 hover:text-white'
+                                    }`}
+                                    title={isPlayingCine ? "Pause Cine Loop" : "Play Cine Loop"}
+                                >
+                                    {isPlayingCine ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
+                                </button>
+                                <select
+                                    value={cineFps}
+                                    onChange={(e) => setCineFps(Number(e.target.value))}
+                                    className="bg-transparent text-[10px] text-amber-400 font-mono font-bold focus:outline-none cursor-pointer"
+                                    title="CINE Playback Speed (Frames Per Second)"
+                                >
+                                    <option value={10}>10 fps</option>
+                                    <option value={15}>15 fps</option>
+                                    <option value={20}>20 fps</option>
+                                    <option value={25}>25 fps</option>
+                                    <option value={30}>30 fps</option>
+                                </select>
+                            </div>
                         )}
 
-                        {/* CASE 1: 2D Cine (1 Slice, Multiple Cardiac Phases e.g. 001_LA_CINE.nii) */}
-                        {(parsedOriginal.numTimeFrames || 1) > 1 && parsedOriginal.numSlices <= 1 && (
-                            <>
+                        {/* Spatial Slice Navigation (when volume has multiple spatial slices) */}
+                        {parsedOriginal.numSlices > 1 && (
+                            <div className="flex items-center space-x-2 flex-shrink-0">
+                                <button
+                                    onClick={() => setCurrentSlice((prev) => Math.max(0, prev - 1))}
+                                    disabled={currentSlice === 0}
+                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
+                                    title="Previous Spatial Slice"
+                                >
+                                    <ChevronLeft className="w-4 h-4" />
+                                </button>
+                                <span className="text-cyan-300 w-28 text-center font-bold">
+                                    Slice {currentSlice + 1} / {parsedOriginal.numSlices}
+                                </span>
+                                <button
+                                    onClick={() => setCurrentSlice((prev) => Math.min(parsedOriginal.numSlices - 1, prev + 1))}
+                                    disabled={currentSlice === parsedOriginal.numSlices - 1}
+                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
+                                    title="Next Spatial Slice"
+                                >
+                                    <ChevronRight className="w-4 h-4" />
+                                </button>
+
+                                {parsedOriginal.numTimeFrames <= 1 && (
+                                    <input
+                                        type="range"
+                                        min="0"
+                                        max={parsedOriginal.numSlices - 1}
+                                        value={currentSlice}
+                                        onChange={(e) => setCurrentSlice(Number(e.target.value))}
+                                        className="w-36 accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                                        title="Navigate Spatial Slices"
+                                    />
+                                )}
+                            </div>
+                        )}
+
+                        {parsedOriginal.numSlices > 1 && (parsedOriginal.numTimeFrames || 1) > 1 && (
+                            <div className="h-4 w-px bg-slate-700 mx-1 flex-shrink-0" />
+                        )}
+
+                        {/* Temporal Frames / Cardiac Phases / Inversion Times (TI) Scrubber Slider */}
+                        {(parsedOriginal.numTimeFrames || 1) > 1 && (
+                            <div className="flex items-center space-x-2 flex-1">
                                 <button
                                     onClick={() => setCurrentTimeFrame((prev) => Math.max(0, prev - 1))}
                                     disabled={currentTimeFrame === 0}
                                     className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                                    title="Previous Cardiac Phase"
+                                    title="Previous Timepoint / TI"
                                 >
                                     <ChevronLeft className="w-4 h-4" />
                                 </button>
 
-                                <span className="text-amber-300 w-36 text-center font-bold">
-                                    Phase {currentTimeFrame + 1} / {parsedOriginal.numTimeFrames}
+                                <span className="text-amber-300 font-bold whitespace-nowrap min-w-[140px] text-center">
+                                    {parsedOriginal.isT1Mapping
+                                        ? `TI ${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames} ${currentFrameMeta?.inversionTime ? `(${currentFrameMeta.inversionTime})` : ''}`
+                                        : parsedOriginal.isDense
+                                        ? `Phase ${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames}`
+                                        : `Phase ${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames} ${currentFrameMeta?.triggerTime ? `(${currentFrameMeta.triggerTime})` : ''}`
+                                    }
                                 </span>
 
                                 <button
                                     onClick={() => setCurrentTimeFrame((prev) => Math.min(parsedOriginal.numTimeFrames - 1, prev + 1))}
                                     disabled={currentTimeFrame === parsedOriginal.numTimeFrames - 1}
                                     className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                                    title="Next Cardiac Phase"
+                                    title="Next Timepoint / TI"
                                 >
                                     <ChevronRight className="w-4 h-4" />
                                 </button>
@@ -1284,90 +1374,9 @@ export default function MedicalViewer() {
                                     value={currentTimeFrame}
                                     onChange={(e) => setCurrentTimeFrame(Number(e.target.value))}
                                     className="flex-1 accent-amber-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                                    title={parsedOriginal.isT1Mapping ? "Scrub Inversion Times (TI)" : "Scrub Cardiac Phases"}
                                 />
-                            </>
-                        )}
-
-                        {/* CASE 2: 4D Cine (Multiple Slices AND Multiple Cardiac Phases e.g. 001_SA_CINE.nii) */}
-                        {(parsedOriginal.numTimeFrames || 1) > 1 && parsedOriginal.numSlices > 1 && (
-                            <>
-                                <div className="flex items-center space-x-2">
-                                    <button
-                                        onClick={() => setCurrentSlice((prev) => Math.max(0, prev - 1))}
-                                        disabled={currentSlice === 0}
-                                        className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                                    >
-                                        <ChevronLeft className="w-4 h-4" />
-                                    </button>
-                                    <span className="text-cyan-300 w-28 text-center font-bold">
-                                        Slice {currentSlice + 1} / {parsedOriginal.numSlices}
-                                    </span>
-                                    <button
-                                        onClick={() => setCurrentSlice((prev) => Math.min(parsedOriginal.numSlices - 1, prev + 1))}
-                                        disabled={currentSlice === parsedOriginal.numSlices - 1}
-                                        className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                                    >
-                                        <ChevronRight className="w-4 h-4" />
-                                    </button>
-                                </div>
-
-                                <div className="h-4 w-px bg-slate-700 mx-1" />
-
-                                <div className="flex items-center space-x-2 flex-1">
-                                    <span className="text-amber-300 font-bold whitespace-nowrap">
-                                        Phase {currentTimeFrame + 1} / {parsedOriginal.numTimeFrames}
-                                    </span>
-                                    <input
-                                        type="range"
-                                        min="0"
-                                        max={parsedOriginal.numTimeFrames - 1}
-                                        value={currentTimeFrame}
-                                        onChange={(e) => setCurrentTimeFrame(Number(e.target.value))}
-                                        className="flex-1 accent-amber-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
-                                    />
-                                </div>
-                            </>
-                        )}
-
-                        {/* CASE 3: 3D Static Volume (Multiple Slices, 1 Phase e.g. 001_SA_ED.nii or LGE) */}
-                        {(parsedOriginal.numTimeFrames || 1) <= 1 && parsedOriginal.numSlices > 1 && (
-                            <>
-                                <button
-                                    onClick={() => setCurrentSlice((prev) => Math.max(0, prev - 1))}
-                                    disabled={currentSlice === 0}
-                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                                >
-                                    <ChevronLeft className="w-4 h-4" />
-                                </button>
-
-                                <span className="text-slate-300 w-28 text-center font-bold">
-                                    Slice {currentSlice + 1} / {parsedOriginal.numSlices}
-                                </span>
-
-                                <button
-                                    onClick={() => setCurrentSlice((prev) => Math.min(parsedOriginal.numSlices - 1, prev + 1))}
-                                    disabled={currentSlice === parsedOriginal.numSlices - 1}
-                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                                >
-                                    <ChevronRight className="w-4 h-4" />
-                                </button>
-
-                                <input
-                                    type="range"
-                                    min="0"
-                                    max={parsedOriginal.numSlices - 1}
-                                    value={currentSlice}
-                                    onChange={(e) => setCurrentSlice(Number(e.target.value))}
-                                    className="flex-1 accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
-                                />
-                            </>
-                        )}
-
-                        {/* CASE 4: 2D Static (1 Slice, 1 Phase) */}
-                        {(parsedOriginal.numTimeFrames || 1) <= 1 && parsedOriginal.numSlices <= 1 && (
-                            <span className="text-slate-400 text-center mx-auto">
-                                Single Frame (2D View)
-                            </span>
+                            </div>
                         )}
                     </div>
                 </footer>

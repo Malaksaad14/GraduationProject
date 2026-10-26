@@ -212,6 +212,18 @@ def extract_clinical_from_dicom(ds, filename: str = "") -> dict:
     if study_date and len(study_date) == 8:
         imaging_specs["study_date"] = f"{study_date[:4]}-{study_date[4:6]}-{study_date[6:]}"
 
+    slice_loc = _clean(getattr(ds, "SliceLocation", None))
+    if slice_loc:
+        imaging_specs["slice_location"] = f"{slice_loc} mm"
+
+    inversion_time = _clean(getattr(ds, "InversionTime", None))
+    if inversion_time:
+        imaging_specs["inversion_time"] = f"{inversion_time} ms"
+
+    trigger_time = _clean(getattr(ds, "TriggerTime", None))
+    if trigger_time:
+        imaging_specs["trigger_time"] = f"{trigger_time} ms"
+
     available_sections = []
     if demographics:
         available_sections.append("demographics")

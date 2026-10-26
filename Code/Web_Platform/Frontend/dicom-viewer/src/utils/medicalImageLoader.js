@@ -124,111 +124,387 @@ export async function parseMedicalFile(arrayBuffer, filename) {
             },
         };
     } else {
-        // DICOM parsing via dicom-parser
-        const byteArray = new Uint8Array(arrayBuffer);
-        const dataset = dicomParser.parseDicom(byteArray);
-
-        const rows = dataset.uint16('x00280010') || 256;
-        const cols = dataset.uint16('x00280011') || 256;
-        const bitsAllocated = dataset.uint16('x00280100') || 16;
-        const pixelRepresentation = dataset.uint16('x00280103') || 0; // 0 = unsigned, 1 = signed
-
-        // Check for Multi-frame DICOM (CINE loop or 3D multi-frame)
-        const framesStr = dataset.string('x00280008');
-        const numFrames = framesStr ? Math.max(1, parseInt(framesStr, 10)) : 1;
-        const isCine = numFrames > 1;
-
-        const patientName = dataset.string('x00100010') || 'Anonymous';
-        const patientID = dataset.string('x00100020') || 'N/A';
-        const modality = dataset.string('x00080060') || 'MR';
-        const heartRate = dataset.string('x00181088') || 'N/A';
-        const manufacturer = dataset.string('x00080070');
-        const scannerModel = dataset.string('x00081090');
-        const stationName = dataset.string('x00081010');
-        const institutionName = dataset.string('x00080080');
-        const fieldStrength = dataset.string('x00180087');
-        const studyDesc = dataset.string('x00081030');
-        const seriesDesc = dataset.string('x0008103e');
-
-        const pixelDataElement = dataset.elements.x7fe00010;
-        if (!pixelDataElement) {
-            throw new Error('No pixel data found in DICOM file.');
-        }
-
-        let pixelData;
-        if (bitsAllocated === 8) {
-            pixelData = new Uint8Array(byteArray.buffer, pixelDataElement.dataOffset, pixelDataElement.length);
-        } else if (pixelRepresentation === 1) {
-            pixelData = new Int16Array(byteArray.buffer, pixelDataElement.dataOffset, pixelDataElement.length / 2);
-        } else {
-            pixelData = new Uint16Array(byteArray.buffer, pixelDataElement.dataOffset, pixelDataElement.length / 2);
-        }
-
-        let min = Infinity;
-        let max = -Infinity;
-        for (let i = 0; i < pixelData.length; i++) {
-            const v = pixelData[i];
-            if (v < min) min = v;
-            if (v > max) max = v;
-        }
-
-        const wcStr = dataset.string('x00281050');
-        const wwStr = dataset.string('x00281051');
-
-        const wc = wcStr ? parseFloat(wcStr) : min + (max - min) / 2;
-        const ww = wwStr ? parseFloat(wwStr) : max - min || 1;
-
-        const frameSize = cols * rows;
-
-        // If multi-frame, each frame is accessed sequentially:
-        const getSliceData = (sliceIndex = 0, timeFrameIndex = 0) => {
-            if (numFrames <= 1) {
-                return pixelData;
-            }
-            // For multi-frame cine, index by timeFrameIndex or sliceIndex
-            const idx = Math.max(0, Math.min(timeFrameIndex || sliceIndex, numFrames - 1));
-            const start = idx * frameSize;
-            return pixelData.subarray(start, start + frameSize);
-        };
-
-        return {
-            type: 'dicom',
-            filename,
-            cols,
-            rows,
-            numSlices: 1,
-            numTimeFrames: numFrames,
-            isCine,
-            min,
-            max,
-            defaultWindowCenter: wc,
-            defaultWindowWidth: ww,
-            getSliceData,
-            metadata: {
-                FileType: 'DICOM (.dcm)',
-                Filename: filename,
-                PatientName: patientName,
-                PatientID: patientID,
-                Modality: modality,
-                Dimensions: isCine ? `${cols} × ${rows} (${numFrames} Frames CINE)` : `${cols} × ${rows}`,
-                NumberOfFrames: numFrames,
-                IsCine: isCine ? 'Yes (Multi-frame Cine)' : 'No (Single frame)',
-                HeartRate: heartRate !== 'N/A' ? `${heartRate} bpm` : 'N/A',
-                Manufacturer: manufacturer || 'N/A',
-                ScannerModel: scannerModel || 'N/A',
-                StationName: stationName || 'N/A',
-                InstitutionName: institutionName || 'N/A',
-                FieldStrength: fieldStrength ? `${fieldStrength} T` : 'N/A',
-                StudyDescription: studyDesc || 'N/A',
-                SeriesDescription: seriesDesc || 'N/A',
-                BitsAllocated: bitsAllocated,
-                WindowCenter: wc.toFixed(1),
-                WindowWidth: ww.toFixed(1),
-                MinPixelValue: min.toFixed(1),
-                MaxPixelValue: max.toFixed(1),
-            },
-        };
+        // Single-file DICOM parsing via parseDicomHeaderAndPixel & assembleDicomSeries
+        const item = parseDicomHeaderAndPixel(arrayBuffer, filename);
+        return assembleDicomSeries([item], filename);
     }
+}
+
+/**
+ * Parses individual DICOM file headers and pixel data.
+ */
+export function parseDicomHeaderAndPixel(arrayBuffer, filename, fileObj = null) {
+    const byteArray = new Uint8Array(arrayBuffer);
+    const dataset = dicomParser.parseDicom(byteArray);
+
+    const rows = dataset.uint16('x00280010') || 256;
+    const cols = dataset.uint16('x00280011') || 256;
+    const bitsAllocated = dataset.uint16('x00280100') || 16;
+    const pixelRepresentation = dataset.uint16('x00280103') || 0;
+
+    const framesStr = dataset.string('x00280008');
+    const numFrames = framesStr ? Math.max(1, parseInt(framesStr, 10)) : 1;
+
+    const pixelDataElement = dataset.elements.x7fe00010;
+    if (!pixelDataElement) {
+        throw new Error(`No pixel data found in DICOM file ${filename}`);
+    }
+
+    let pixelData;
+    if (bitsAllocated === 8) {
+        pixelData = new Uint8Array(byteArray.buffer, pixelDataElement.dataOffset, pixelDataElement.length);
+    } else if (pixelRepresentation === 1) {
+        pixelData = new Int16Array(byteArray.buffer, pixelDataElement.dataOffset, pixelDataElement.length / 2);
+    } else {
+        pixelData = new Uint16Array(byteArray.buffer, pixelDataElement.dataOffset, pixelDataElement.length / 2);
+    }
+
+    let min = Infinity;
+    let max = -Infinity;
+    for (let i = 0; i < pixelData.length; i++) {
+        const v = pixelData[i];
+        if (v < min) min = v;
+        if (v > max) max = v;
+    }
+
+    const wcStr = dataset.string('x00281050');
+    const wwStr = dataset.string('x00281051');
+    const wc = wcStr ? parseFloat(wcStr) : min + (max - min) / 2;
+    const ww = wwStr ? parseFloat(wwStr) : max - min || 1;
+
+    const cleanStr = (tag) => {
+        const val = dataset.string(tag);
+        return val ? val.trim() : null;
+    };
+
+    return {
+        filename,
+        file: fileObj,
+        cols,
+        rows,
+        bitsAllocated,
+        numFrames,
+        pixelData,
+        min,
+        max,
+        wc,
+        ww,
+        seriesInstanceUID: cleanStr('x0020000e'),
+        seriesDescription: cleanStr('x0008103e'),
+        seriesNumber: cleanStr('x00200011'),
+        studyDescription: cleanStr('x00081030'),
+        protocolName: cleanStr('x00181030'),
+        patientName: cleanStr('x00100010'),
+        patientID: cleanStr('x00100020'),
+        modality: cleanStr('x00080060') || 'MR',
+        imagePositionPatient: cleanStr('x00200032'),
+        imageOrientationPatient: cleanStr('x00200037'),
+        sliceLocation: cleanStr('x00201041'),
+        sliceThickness: cleanStr('x00180050'),
+        pixelSpacing: cleanStr('x00280030'),
+        triggerTime: cleanStr('x00181060'),
+        nominalInterval: cleanStr('x00181062'),
+        cardiacNumberOfImages: cleanStr('x00181090'),
+        instanceNumber: cleanStr('x00200013'),
+        temporalPositionIdentifier: cleanStr('x00200100'),
+        inversionTime: cleanStr('x00180082'),
+        echoTime: cleanStr('x00180081'),
+        manufacturer: cleanStr('x00080070'),
+        scannerModel: cleanStr('x00081090'),
+        stationName: cleanStr('x00081010'),
+        institutionName: cleanStr('x00080080'),
+        fieldStrength: cleanStr('x00180087'),
+        heartRate: cleanStr('x00181088'),
+    };
+}
+
+/**
+ * Assembles a collection of DICOM slices into a multi-dimensional volume/CINE sequence.
+ */
+export function assembleDicomSeries(items, seriesName) {
+    if (!items || items.length === 0) return null;
+
+    const first = items[0];
+    const cols = first.cols;
+    const rows = first.rows;
+    let min = Infinity;
+    let max = -Infinity;
+    for (const item of items) {
+        if (item.min < min) min = item.min;
+        if (item.max > max) max = item.max;
+    }
+
+    // Function to calculate spatial position along slice normal vector
+    const getSpatialCoord = (item) => {
+        if (item.imagePositionPatient) {
+            const coords = item.imagePositionPatient.split('\\').map(Number);
+            if (coords.length === 3 && !isNaN(coords[2])) {
+                if (item.imageOrientationPatient) {
+                    const o = item.imageOrientationPatient.split('\\').map(Number);
+                    if (o.length === 6) {
+                        const nx = o[1] * o[5] - o[2] * o[4];
+                        const ny = o[2] * o[3] - o[0] * o[5];
+                        const nz = o[0] * o[4] - o[1] * o[3];
+                        return nx * coords[0] + ny * coords[1] + nz * coords[2];
+                    }
+                }
+                return coords[2];
+            }
+        }
+        if (item.sliceLocation !== null && item.sliceLocation !== undefined && !isNaN(parseFloat(item.sliceLocation))) {
+            return parseFloat(item.sliceLocation);
+        }
+        if (item.instanceNumber !== null && item.instanceNumber !== undefined && !item.triggerTime && !item.inversionTime) {
+            return parseInt(item.instanceNumber, 10);
+        }
+        return 0;
+    };
+
+    // Cluster items by spatial coordinate (tolerance 0.4mm for grouping identical slice positions)
+    const spatialGroups = [];
+    for (const item of items) {
+        const coord = getSpatialCoord(item);
+        let group = spatialGroups.find((g) => Math.abs(g.coord - coord) < 0.4);
+        if (!group) {
+            group = { coord, items: [] };
+            spatialGroups.push(group);
+        }
+        group.items.push(item);
+    }
+
+    // Sort spatial positions ascending (anatomical order base to apex)
+    spatialGroups.sort((a, b) => a.coord - b.coord);
+    const numSlices = spatialGroups.length;
+
+    // Within each spatial slice, sort temporal frames
+    for (const group of spatialGroups) {
+        group.items.sort((a, b) => {
+            if (a.triggerTime !== null && b.triggerTime !== null) {
+                return parseFloat(a.triggerTime) - parseFloat(b.triggerTime);
+            }
+            if (a.inversionTime !== null && b.inversionTime !== null) {
+                return parseFloat(a.inversionTime) - parseFloat(b.inversionTime);
+            }
+            if (a.echoTime !== null && b.echoTime !== null) {
+                return parseFloat(a.echoTime) - parseFloat(b.echoTime);
+            }
+            if (a.temporalPositionIdentifier !== null && b.temporalPositionIdentifier !== null) {
+                return parseInt(a.temporalPositionIdentifier, 10) - parseInt(b.temporalPositionIdentifier, 10);
+            }
+            if (a.instanceNumber !== null && b.instanceNumber !== null) {
+                return parseInt(a.instanceNumber, 10) - parseInt(b.instanceNumber, 10);
+            }
+            return a.filename.localeCompare(b.filename, undefined, { numeric: true });
+        });
+    }
+
+    // Temporal frames count
+    let numTimeFrames = Math.max(...spatialGroups.map((g) => g.items.length));
+    if (items.length === 1 && first.numFrames > 1) {
+        numTimeFrames = first.numFrames;
+    }
+
+    // Sequence & Dimensionality Detection
+    const tis = items.map((it) => it.inversionTime).filter(Boolean);
+    const uniqueTIs = new Set(tis);
+    const hasVaryingTI = uniqueTIs.size > 1;
+
+    const tes = items.map((it) => it.echoTime).filter(Boolean);
+    const uniqueTEs = new Set(tes);
+    const hasVaryingTE = uniqueTEs.size > 1;
+
+    const isT1Mapping = hasVaryingTI || /t1.*map|molli|shmolli|sasha/i.test(seriesName);
+    const isDense = /dense/i.test(seriesName);
+    const isMultiEcho = hasVaryingTE;
+    const isCine =
+        numTimeFrames > 1 &&
+        !isT1Mapping &&
+        !isMultiEcho &&
+        (items.some((it) => it.triggerTime !== null || (it.cardiacNumberOfImages && parseInt(it.cardiacNumberOfImages, 10) > 1)) ||
+            /cine|bssfp|truefisp|fiesta|bffe/i.test(seriesName) ||
+            isDense ||
+            first.numFrames > 1);
+
+    let dimensionType = '2D';
+    let dimDesc = `${cols} × ${rows} (2D Single Slice)`;
+    if (numTimeFrames > 1) {
+        dimensionType = '4D';
+        if (isT1Mapping) {
+            dimDesc = `${cols} × ${rows} × ${numSlices} (${numTimeFrames} TIs T1 Map)`;
+        } else if (isCine) {
+            dimDesc = `${cols} × ${rows} × ${numSlices} × ${numTimeFrames} (4D CINE)`;
+        } else {
+            dimDesc = `${cols} × ${rows} × ${numSlices} × ${numTimeFrames} (Time Series)`;
+        }
+    } else if (numSlices > 1) {
+        dimensionType = '3D';
+        dimDesc = `${cols} × ${rows} × ${numSlices} (3D Volume)`;
+    }
+
+    const frameSize = cols * rows;
+
+    // getSliceData(sliceIndex, timeFrameIndex)
+    const getSliceData = (sliceIndex = 0, timeFrameIndex = 0) => {
+        const z = Math.max(0, Math.min(sliceIndex, numSlices - 1));
+        const group = spatialGroups[z];
+        if (!group || group.items.length === 0) return null;
+
+        if (group.items.length === 1 && group.items[0].numFrames > 1) {
+            const item = group.items[0];
+            const t = Math.max(0, Math.min(timeFrameIndex, item.numFrames - 1));
+            return item.pixelData.subarray(t * frameSize, (t + 1) * frameSize);
+        }
+
+        const t = Math.max(0, Math.min(timeFrameIndex, group.items.length - 1));
+        const item = group.items[t];
+        return item.pixelData;
+    };
+
+    // getTimeFrameMeta(sliceIndex, timeFrameIndex)
+    const getTimeFrameMeta = (sliceIndex = 0, timeFrameIndex = 0) => {
+        const z = Math.max(0, Math.min(sliceIndex, numSlices - 1));
+        const group = spatialGroups[z];
+        if (!group || group.items.length === 0) return null;
+        const t = Math.max(0, Math.min(timeFrameIndex, group.items.length - 1));
+        const item = group.items[t];
+        return {
+            triggerTime: item.triggerTime ? `${parseFloat(item.triggerTime).toFixed(1)} ms` : null,
+            inversionTime: item.inversionTime ? `${parseFloat(item.inversionTime).toFixed(1)} ms` : null,
+            echoTime: item.echoTime ? `${parseFloat(item.echoTime).toFixed(1)} ms` : null,
+            instanceNumber: item.instanceNumber,
+            sliceLocation: item.sliceLocation ? `${parseFloat(item.sliceLocation).toFixed(1)} mm` : null,
+            phaseIndex: t + 1,
+            totalPhases: numTimeFrames,
+            isCine,
+            isT1Mapping,
+            isDense,
+        };
+    };
+
+    return {
+        type: 'dicom',
+        filename: seriesName,
+        cols,
+        rows,
+        numSlices,
+        numTimeFrames,
+        isCine,
+        isT1Mapping,
+        isDense,
+        isMultiEcho,
+        hasVaryingTI,
+        dimensionType,
+        min,
+        max,
+        defaultWindowCenter: first.wc,
+        defaultWindowWidth: first.ww,
+        getSliceData,
+        getTimeFrameMeta,
+        items,
+        metadata: {
+            FileType: 'DICOM (.dcm)',
+            Filename: seriesName,
+            PatientName: first.patientName || 'Anonymous',
+            PatientID: first.patientID || 'N/A',
+            Modality: first.modality || 'MR',
+            Dimensions: dimDesc,
+            DimensionType: dimensionType,
+            SpatialSlices: numSlices,
+            CardiacPhases: numTimeFrames,
+            IsCine: isCine ? 'Yes (Dynamic CINE Motion)' : 'No',
+            HeartRate: first.heartRate && first.heartRate !== 'N/A' ? `${first.heartRate} bpm` : 'N/A',
+            Manufacturer: first.manufacturer || 'N/A',
+            ScannerModel: first.scannerModel || 'N/A',
+            StationName: first.stationName || 'N/A',
+            InstitutionName: first.institutionName || 'N/A',
+            FieldStrength: first.fieldStrength ? `${first.fieldStrength} T` : 'N/A',
+            StudyDescription: first.studyDescription || 'N/A',
+            SeriesDescription: first.seriesDescription || seriesName,
+            ProtocolName: first.protocolName || 'N/A',
+            BitsAllocated: first.bitsAllocated,
+            WindowCenter: first.wc.toFixed(1),
+            WindowWidth: first.ww.toFixed(1),
+            MinPixelValue: min.toFixed(1),
+            MaxPixelValue: max.toFixed(1),
+        },
+    };
+}
+
+/**
+ * Group multiple uploaded DICOM files by series and assemble them into 3D/4D series objects.
+ */
+export async function groupAndAssembleDicomFiles(dicomFiles) {
+    if (!dicomFiles || dicomFiles.length === 0) return [];
+
+    const parsedItems = [];
+    for (const file of dicomFiles) {
+        try {
+            const buffer = await file.arrayBuffer();
+            const item = parseDicomHeaderAndPixel(buffer, file.name, file);
+            parsedItems.push(item);
+        } catch (err) {
+            console.warn(`Failed parsing DICOM file ${file.name}:`, err);
+        }
+    }
+
+    if (parsedItems.length === 0) return [];
+
+    // Group items into Series
+    const seriesGroups = new Map();
+    for (const item of parsedItems) {
+        let seriesKey = 'DICOM_Series';
+        const file = item.file;
+        if (file && file.webkitRelativePath) {
+            const parts = file.webkitRelativePath.split('/');
+            if (parts.length >= 2) {
+                seriesKey = parts[parts.length - 2];
+            }
+        } else if (item.seriesInstanceUID) {
+            seriesKey = item.seriesInstanceUID;
+        } else if (item.seriesDescription && item.seriesDescription.trim().length > 0) {
+            seriesKey = item.seriesDescription.trim();
+        } else {
+            const match = item.filename.match(/^([a-zA-Z0-9_\-\s]+?)(?:[_\-\s]?\d+)?\.(?:dcm|dicom)$/i);
+            if (match && match[1]) seriesKey = match[1].trim();
+        }
+
+        if (!seriesGroups.has(seriesKey)) {
+            seriesGroups.set(seriesKey, []);
+        }
+        seriesGroups.get(seriesKey).push(item);
+    }
+
+    const assembledSeriesList = [];
+    for (const [key, groupItems] of seriesGroups.entries()) {
+        const first = groupItems[0];
+        let seriesName = first.seriesDescription || key;
+        if (first.file && first.file.webkitRelativePath) {
+            const parts = first.file.webkitRelativePath.split('/');
+            if (parts.length >= 2) {
+                seriesName = parts[parts.length - 2];
+            }
+        }
+        const assembled = assembleDicomSeries(groupItems, seriesName);
+        if (assembled) {
+            assembledSeriesList.push({
+                id: `series_${key}_${groupItems.length}`,
+                file: first.file,
+                filename: seriesName,
+                parsed: assembled,
+                thumbnailUrl: generateThumbnailUrl(assembled),
+                numSlices: assembled.numSlices,
+                numTimeFrames: assembled.numTimeFrames,
+                cols: assembled.cols,
+                rows: assembled.rows,
+                type: 'dicom',
+                viewType: seriesName,
+                hasLocalization: false,
+                localizedResult: null,
+            });
+        }
+    }
+
+    return assembledSeriesList;
 }
 
 /**

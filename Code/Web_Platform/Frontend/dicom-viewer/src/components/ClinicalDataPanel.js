@@ -117,7 +117,6 @@ const ClinicalDataPanel = React.memo(function ClinicalDataPanel({ clinicalData, 
         lab_results = [],
         risk_factors = {},
         raw_record = {},
-        source,
         available_sections = [],
     } = clinicalData;
 
@@ -157,6 +156,9 @@ const ClinicalDataPanel = React.memo(function ClinicalDataPanel({ clinicalData, 
         "Echo Time": imaging_specs.echo_time,
         "Flip Angle": imaging_specs.flip_angle,
         "Study Date": imaging_specs.study_date,
+        "Slice Location": imaging_specs.slice_location,
+        "Inversion Time (TI)": imaging_specs.inversion_time,
+        "Trigger Time": imaging_specs.trigger_time,
         "Centre": imaging_specs.centre,
         "Slice Gap": imaging_specs.gap_between_slices,
     }).filter(([, v]) => hasValue(v));

@@ -53,23 +53,49 @@ async def upload_dicom(dicom_file: UploadFile = File(...)):
 
     num_frames = safe_get("NumberOfFrames")
     is_multi_frame = num_frames is not None and num_frames.isdigit() and int(num_frames) > 1
+    trigger_time = safe_get("TriggerTime")
+    inversion_time = safe_get("InversionTime")
+    slice_loc = safe_get("SliceLocation")
+    series_desc = safe_get("SeriesDescription")
+    echo_time = safe_get("EchoTime")
+
+    # Dynamic Dimensionality Detection
+    if is_multi_frame and (trigger_time or "cine" in str(series_desc).lower() or safe_get("CardiacNumberOfImages")):
+        dimensionality = "4D CINE (Multi-frame)"
+    elif is_multi_frame:
+        dimensionality = "3D/4D Multi-frame Volume"
+    elif inversion_time:
+        dimensionality = "T1 Mapping (Multi-TI)"
+    elif trigger_time or ("cine" in str(series_desc).lower()):
+        dimensionality = "4D CINE Timeframe"
+    elif slice_loc:
+        dimensionality = "3D Volume Slice"
+    else:
+        dimensionality = "2D Single Slice"
 
     # Build metadata with only present DICOM tags (skip None/absent ones)
     raw_meta = {
-        "PatientName":    safe_get("PatientName"),
-        "PatientID":      patient_id if patient_id != "Unknown" else safe_get("PatientID"),
-        "StudyDate":      safe_get("StudyDate"),
-        "Modality":       safe_get("Modality"),
-        "Rows":           safe_get("Rows"),
-        "Columns":        safe_get("Columns"),
-        "ImageShape":     str(pixel_array.shape),
-        "NumberOfFrames": num_frames,
-        "IsCine":         is_multi_frame,
-        "HeartRate":      safe_get("HeartRate"),
-        "TriggerTime":    safe_get("TriggerTime"),
-        "NominalInterval":safe_get("NominalInterval"),
-        "RepetitionTime": safe_get("RepetitionTime"),
-        "EchoTime":       safe_get("EchoTime"),
+        "PatientName":         safe_get("PatientName"),
+        "PatientID":           patient_id if patient_id != "Unknown" else safe_get("PatientID"),
+        "StudyDate":           safe_get("StudyDate"),
+        "Modality":            safe_get("Modality"),
+        "Dimensionality":      dimensionality,
+        "SeriesInstanceUID":   safe_get("SeriesInstanceUID"),
+        "SeriesDescription":   series_desc,
+        "SeriesNumber":        safe_get("SeriesNumber"),
+        "Rows":                safe_get("Rows"),
+        "Columns":             safe_get("Columns"),
+        "ImageShape":          str(pixel_array.shape),
+        "SliceLocation":       slice_loc,
+        "ImagePositionPatient":safe_get("ImagePositionPatient"),
+        "InversionTime":       inversion_time,
+        "NumberOfFrames":      num_frames,
+        "IsCine":              is_multi_frame or ("cine" in str(series_desc).lower()),
+        "HeartRate":           safe_get("HeartRate"),
+        "TriggerTime":         trigger_time,
+        "NominalInterval":     safe_get("NominalInterval"),
+        "RepetitionTime":      safe_get("RepetitionTime"),
+        "EchoTime":            echo_time,
     }
     metadata = {k: v for k, v in raw_meta.items() if v is not None}
     metadata["ClinicalData"] = clinical_info  # always include
