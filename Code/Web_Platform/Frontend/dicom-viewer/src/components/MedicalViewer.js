@@ -1443,12 +1443,18 @@ export default function MedicalViewer() {
                 activeScanInfo={
                     parsedOriginal
                         ? {
-                              fileName: rawFile?.name,
+                              fileName: currentSeriesObj?.filename || rawFile?.name || 'Cardiac Scan',
                               type: parsedOriginal.type,
                               currentSlice,
                               totalSlices: parsedOriginal.numSlices,
                               rows: parsedOriginal.rows,
-                              cols: parsedOriginal.cols
+                              cols: parsedOriginal.cols,
+                              sequenceType: currentSeriesObj?.sequenceType || currentSeriesObj?.name || 'Cardiac MRI',
+                              patientName: patientStudyName || 'Patient Study',
+                              hasAiMask: Boolean(currentSeriesObj?.aiMask),
+                              hasGtMask: Boolean(activeGtMask || currentSeriesObj?.hasGtMask),
+                              clinicalData: clinicalData || null,
+                              metadata: parsedOriginal.metadata || null
                           }
                         : null
                 }

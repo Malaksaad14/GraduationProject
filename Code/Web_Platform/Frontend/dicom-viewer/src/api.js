@@ -1,5 +1,5 @@
 /**
- * api.js — Centralized API service for the FastAPI backend.
+ * api.js â€” Centralized API service for the FastAPI backend.
  *
  * Base URL: http://127.0.0.1:8000
  */
@@ -216,5 +216,45 @@ export async function dicomToNifti(file) {
  */
 export async function healthCheck() {
     const response = await fetch(`${BASE_URL}/health`);
+    return response.json();
+}
+
+
+/**
+ * Check Gemini Chatbot health and active model configuration.
+ */
+export async function getChatbotHealth() {
+    try {
+        const response = await fetch(`${BASE_URL}/chatbot/health`);
+        if (!response.ok) return { status: 'offline', model: 'gemini-3.5-flash', api_key_set: false };
+        return await response.json();
+    } catch {
+        return { status: 'offline', model: 'gemini-3.5-flash', api_key_set: false };
+    }
+}
+
+/**
+ * Send a message to the Gemini AI chatbot.
+ * @param {string} message - User query.
+ * @param {object|null} scanContext - Optional scan metadata.
+ * @param {boolean} isLocalized - Whether LV localizer has run.
+ * @returns {{ reply: string, model: string }}
+ */
+export async function askChatbot(message, scanContext = null, isLocalized = false) {
+    const response = await fetch(`${BASE_URL}/chatbot/ask`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            message,
+            scan_context: scanContext,
+            is_localized: isLocalized,
+        }),
+    });
+
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || `Chatbot request failed (${response.status})`);
+    }
+
     return response.json();
 }
