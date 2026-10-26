@@ -25,7 +25,8 @@ import {
     Sparkles,
     Layers,
     FolderOpen,
-    ShieldCheck
+    ShieldCheck,
+    HeartPulse
 } from 'lucide-react';
 import { localizeDicom, localizeNifti, uploadDicom, uploadNifti, healthCheck } from '../api';
 import {
@@ -84,6 +85,14 @@ export default function MedicalViewer() {
     const [isPlayingCine, setIsPlayingCine] = useState(false);
     const [isDragOver, setIsDragOver] = useState(false);
     const [isUploadMenuOpen, setIsUploadMenuOpen] = useState(false);
+    const [chatbotExternalTrigger, setChatbotExternalTrigger] = useState(null);
+
+    const handleAssessViability = useCallback(() => {
+        setChatbotExternalTrigger({
+            prompt: "Assess myocardial viability for this scan",
+            timestamp: Date.now()
+        });
+    }, []);
 
     // ── Refs ───────────────────────────────────────────────────────────────────
     const origCanvasRef = useRef(null);
@@ -820,6 +829,24 @@ export default function MedicalViewer() {
 
                     <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
 
+                    {/* Assess Myocardial Viability Button */}
+                    <button
+                        id="workstation-assess-viability-btn"
+                        onClick={handleAssessViability}
+                        disabled={!parsedOriginal}
+                        className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg font-bold transition shadow-lg active:scale-95 flex-shrink-0 whitespace-nowrap cursor-pointer ${
+                            !parsedOriginal
+                                ? 'bg-slate-900 text-slate-500 cursor-not-allowed border border-slate-800'
+                                : 'bg-gradient-to-r from-rose-700 via-red-600 to-rose-600 hover:from-rose-600 hover:to-red-500 text-white ring-2 ring-rose-500/40 shadow-rose-950/50'
+                        }`}
+                        title="Assess Myocardial Viability for this scan with Gemini AI Chatbot"
+                    >
+                        <HeartPulse className="w-3.5 h-3.5 text-rose-200 fill-rose-300/20" />
+                        <span>Assess Viability</span>
+                    </button>
+
+                    <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
+
                     {/* View Modes Toggle */}
                     <div className="flex items-center bg-slate-900/90 p-1 rounded-lg border border-slate-800 space-x-1 flex-shrink-0 whitespace-nowrap">
                         <button
@@ -1459,6 +1486,7 @@ export default function MedicalViewer() {
                         : null
                 }
                 isLocalized={Boolean(parsedLocalized)}
+                externalTrigger={chatbotExternalTrigger}
             />
         </div>
     );
