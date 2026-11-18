@@ -1,16 +1,11 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
     Upload,
-    Zap,
     Columns,
     Square,
     RotateCcw,
     Sun,
     Move,
-    Activity,
-    CheckCircle2,
-    AlertCircle,
-    FileText,
     ZoomIn,
     ZoomOut,
     Search,
@@ -23,24 +18,154 @@ import {
     HelpCircle,
     X,
     Sparkles,
-    Layers,
     FolderOpen,
-    ShieldCheck,
-    HeartPulse
+    Folder,
+    ShieldCheck
 } from 'lucide-react';
 import { localizeDicom, localizeNifti, uploadDicom, uploadNifti, healthCheck } from '../api';
 import {
     parseMedicalFile,
     renderSliceToCanvas,
     base64ToArrayBuffer,
-    generateThumbnailUrl,
     isGroundTruthMask,
     getBaseScanName,
-    groupAndAssembleDicomFiles
+    buildHierarchicalStudyTree,
+    assembleSingleStudy
 } from '../utils/medicalImageLoader';
 import AIChatbot from './AIChatbot';
 import ClinicalDataPanel from './ClinicalDataPanel';
-import SeriesBrowser, { getSequenceFriendlyName } from './SeriesBrowser';
+import SeriesBrowser from './SeriesBrowser';
+import StudyHierarchyBrowser from './StudyHierarchyBrowser';
+
+// ── Recursive Directory Tree Helpers & Component ─────────────────────────────
+function checkDescendantMatches(node, q) {
+    if (!node || !node.children) return false;
+    return node.children.some(
+        (child) => child.name.toLowerCase().includes(q) || checkDescendantMatches(child, q)
+    );
+}
+
+function checkHasActiveDescendant(node, activeStudyId) {
+    if (!node || !node.children || !activeStudyId) return false;
+    return node.children.some(
+        (child) => (child.study && child.study.id === activeStudyId) || checkHasActiveDescendant(child, activeStudyId)
+    );
+}
+
+function DirectoryTreeNode({
+    node,
+    depth = 0,
+    activeStudyId,
+    expandedNodes,
+    onToggleExpand,
+    onOpenStudy,
+    filterText = ''
+}) {
+    const q = filterText ? filterText.trim().toLowerCase() : '';
+    const matchesSelf = q ? node.name.toLowerCase().includes(q) : true;
+    const hasMatchingDescendant = q ? checkDescendantMatches(node, q) : true;
+
+    if (q && !matchesSelf && !hasMatchingDescendant) {
+        return null;
+    }
+
+    const hasChildren = node.children && node.children.length > 0;
+    const isExpanded = q ? true : expandedNodes.has(node.id);
+    const isStudyNode = Boolean(node.study);
+    const isActive = node.study && node.study.id === activeStudyId;
+    const hasActiveChild = checkHasActiveDescendant(node, activeStudyId);
+
+    return (
+        <div className="space-y-0.5 select-none font-mono">
+            <div
+                onClick={() => {
+                    if (isStudyNode) {
+                        onOpenStudy(node.study);
+                    } else if (hasChildren) {
+                        onToggleExpand(node.id);
+                    }
+                }}
+                style={{ paddingLeft: `${depth * 12 + 6}px` }}
+                className={`group py-1.5 pr-2 rounded cursor-pointer border transition duration-150 flex items-center justify-between ${
+                    isActive
+                        ? 'bg-white/15 border-white/30 text-white font-semibold'
+                        : hasActiveChild
+                        ? 'bg-white/5 border-white/15 text-white/90'
+                        : 'border-transparent hover:bg-white/5 text-white/65 hover:text-white'
+                }`}
+                title={node.fullPath || node.name}
+            >
+                <div className="flex items-center gap-1.5 min-w-0 truncate">
+                    {hasChildren ? (
+                        <button
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                onToggleExpand(node.id);
+                            }}
+                            className="p-0.5 hover:text-white text-white/40 transition flex-shrink-0"
+                        >
+                            {isExpanded ? (
+                                <ChevronDown className="w-3.5 h-3.5" />
+                            ) : (
+                                <ChevronRight className="w-3.5 h-3.5" />
+                            )}
+                        </button>
+                    ) : (
+                        <div className="w-3.5 h-3.5 flex items-center justify-center flex-shrink-0">
+                            <div className={`w-1.5 h-1.5 rounded-full ${isActive ? 'bg-white' : 'bg-white/30 group-hover:bg-white/70'}`} />
+                        </div>
+                    )}
+
+                    {hasChildren ? (
+                        <Folder className={`w-3.5 h-3.5 flex-shrink-0 ${isExpanded ? 'text-white/70' : 'text-white/40'}`} />
+                    ) : null}
+
+                    <span className={`truncate text-[11px] ${
+                        isActive
+                            ? 'text-white'
+                            : hasActiveChild
+                            ? 'text-white/90 font-medium'
+                            : 'text-white/70 group-hover:text-white'
+                    }`}>
+                        {node.name}
+                    </span>
+                </div>
+
+                <div className="flex items-center gap-1 ml-1 flex-shrink-0">
+                    {isStudyNode ? (
+                        <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${
+                            isActive ? 'bg-white/20 text-white font-bold' : 'bg-white/5 text-white/30'
+                        }`}>
+                            {node.study.imageCount} imgs
+                        </span>
+                    ) : (
+                        <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-white/30">
+                            {node.totalStudies} {node.totalStudies === 1 ? 'scan' : 'scans'}
+                        </span>
+                    )}
+                </div>
+            </div>
+
+            {/* Recursively Render Child Nodes */}
+            {hasChildren && isExpanded && (
+                <div className="space-y-0.5 relative">
+                    {node.children.map((child) => (
+                        <DirectoryTreeNode
+                            key={child.id}
+                            node={child}
+                            depth={depth + 1}
+                            activeStudyId={activeStudyId}
+                            expandedNodes={expandedNodes}
+                            onToggleExpand={onToggleExpand}
+                            onOpenStudy={onOpenStudy}
+                            filterText={filterText}
+                        />
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
 
 export default function MedicalViewer() {
     // ── File & Series State ────────────────────────────────────────────────────
@@ -61,6 +186,29 @@ export default function MedicalViewer() {
     const [showSeriesBrowser, setShowSeriesBrowser] = useState(true);
     const [patientStudyName, setPatientStudyName] = useState('Patient Study');
 
+    // ── Hierarchical Patient Studies State (Documents DB / File Tree) ─────────
+    const [patientHierarchy, setPatientHierarchy] = useState(null);
+    const [activeStudyId, setActiveStudyId] = useState(null);
+    const [showStudiesDbModal, setShowStudiesDbModal] = useState(false);
+    const [isLoadingStudy, setIsLoadingStudy] = useState(false);
+
+    // ── Workstation Sidebar State (Folders on Side) ──────────────────────────
+    const [sidebarTab, setSidebarTab] = useState('folders'); // 'folders' | 'clinical' | 'metadata'
+    const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+    const [subfolderFilter, setSubfolderFilter] = useState('');
+    const [isFolderDropdownOpen, setIsFolderDropdownOpen] = useState(false);
+    const [expandedStudies, setExpandedStudies] = useState(new Set());
+
+    const toggleStudyExpand = useCallback((studyId, e) => {
+        if (e) e.stopPropagation();
+        setExpandedStudies((prev) => {
+            const next = new Set(prev);
+            if (next.has(studyId)) next.delete(studyId);
+            else next.add(studyId);
+            return next;
+        });
+    }, []);
+
     // ── Viewer Controls ────────────────────────────────────────────────────────
     const [windowCenter, setWindowCenter] = useState(0);
     const [windowWidth, setWindowWidth] = useState(0);
@@ -73,13 +221,10 @@ export default function MedicalViewer() {
     // ── UI / Split View State ──────────────────────────────────────────────────
     const [isSplitView, setIsSplitView] = useState(false);
     const [clinicalData, setClinicalData] = useState(null);
-    const [showClinicalPanel, setShowClinicalPanel] = useState(true);
-    const handleCloseClinicalPanel = useCallback(() => setShowClinicalPanel(false), []);
     const [isLoadingLocalizer, setIsLoadingLocalizer] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
     const [backendStatus, setBackendStatus] = useState('checking'); // 'online' | 'offline' | 'checking'
-    const [showMetadata, setShowMetadata] = useState(false);
     const [showShortcutsModal, setShowShortcutsModal] = useState(false);
     const [mousePos, setMousePos] = useState({ x: 0, y: 0, value: 'N/A' });
     const [isPlayingCine, setIsPlayingCine] = useState(false);
@@ -101,6 +246,7 @@ export default function MedicalViewer() {
     const folderInputRef = useRef(null);
     const downloadMenuRef = useRef(null);
     const uploadMenuRef = useRef(null);
+    const folderDropdownRef = useRef(null);
     const containerRef = useRef(null);
 
     // ── Click Outside Listener for Menus ──────────────────────────────────────
@@ -111,6 +257,9 @@ export default function MedicalViewer() {
             }
             if (uploadMenuRef.current && !uploadMenuRef.current.contains(e.target)) {
                 setIsUploadMenuOpen(false);
+            }
+            if (folderDropdownRef.current && !folderDropdownRef.current.contains(e.target)) {
+                setIsFolderDropdownOpen(false);
             }
         };
         document.addEventListener('mousedown', handleClickOutside);
@@ -126,11 +275,50 @@ export default function MedicalViewer() {
 
     // ── Helper: Detect if current scan is a Cardiac Cine sequence ────────────
     const currentSeriesObj = seriesList.find((s) => s.id === activeSeriesId) || null;
-    const isCineImage = Boolean(
+    const activeStudyObj = patientHierarchy?.studies?.find((s) => s.id === activeStudyId) || null;
+
+    const filteredSubfolders = useMemo(() => {
+        if (!patientHierarchy?.studies) return [];
+        if (!subfolderFilter.trim()) return patientHierarchy.studies;
+        const q = subfolderFilter.toLowerCase();
+        return patientHierarchy.studies.filter((s) => {
+            return (
+                (s.name && s.name.toLowerCase().includes(q)) ||
+                (s.category && s.category.toLowerCase().includes(q)) ||
+                (s.sequenceName && s.sequenceName.toLowerCase().includes(q)) ||
+                (s.seriesDescription && s.seriesDescription.toLowerCase().includes(q))
+            );
+        });
+    }, [patientHierarchy, subfolderFilter]);
+
+    const categoriesMap = useMemo(() => {
+        if (!filteredSubfolders || filteredSubfolders.length === 0) return new Map();
+        const map = new Map();
+        for (const study of filteredSubfolders) {
+            const cat = study.category || 'General';
+            if (!map.has(cat)) {
+                map.set(cat, []);
+            }
+            map.get(cat).push(study);
+        }
+        return map;
+    }, [filteredSubfolders]);
+    const isLocalizerScan = Boolean(
+        parsedOriginal?.isLocalizer ||
+        (rawFile?.name && /localizer|scout/i.test(rawFile.name)) ||
+        (currentSeriesObj?.filename && /localizer|scout/i.test(currentSeriesObj.filename)) ||
+        (currentSeriesObj?.viewType && /localizer|scout/i.test(currentSeriesObj.viewType))
+    );
+    const isCineImage = !isLocalizerScan && Boolean(
         parsedOriginal?.isCine ||
         (!parsedOriginal?.isT1Mapping && !parsedOriginal?.isMultiEcho && (parsedOriginal?.numTimeFrames || 1) > 1) ||
         (rawFile?.name && /cine|bssfp|truefisp|fiesta|bffe/i.test(rawFile.name)) ||
         (currentSeriesObj?.filename && /cine|bssfp|truefisp|fiesta|bffe/i.test(currentSeriesObj.filename))
+    );
+    const isT1Image = Boolean(
+        parsedOriginal?.isT1Mapping ||
+        (rawFile?.name && /t1.*map|molli|shmolli|sasha/i.test(rawFile.name)) ||
+        (currentSeriesObj?.filename && /t1.*map|molli|shmolli|sasha/i.test(currentSeriesObj.filename))
     );
     const currentFrameMeta = parsedOriginal?.getTimeFrameMeta
         ? parsedOriginal.getTimeFrameMeta(currentSlice, currentTimeFrame)
@@ -176,15 +364,21 @@ export default function MedicalViewer() {
                 const entry = queue.shift();
                 if (entry.isFile) {
                     const f = await new Promise((resolve) => entry.file(resolve));
-                    if (f) files.push(f);
+                    if (f) {
+                        if (entry.fullPath) {
+                            f.relativePath = entry.fullPath.replace(/^\//, '');
+                        }
+                        files.push(f);
+                    }
                 } else if (entry.isDirectory) {
                     const dirReader = entry.createReader();
-                    const entries = await new Promise((resolve) => {
-                        dirReader.readEntries(resolve, () => resolve([]));
-                    });
-                    for (const child of entries) {
-                        queue.push(child);
-                    }
+                    let batch;
+                    do {
+                        batch = await new Promise((resolve) => dirReader.readEntries(resolve, () => resolve([])));
+                        if (batch && batch.length > 0) {
+                            for (const child of batch) queue.push(child);
+                        }
+                    } while (batch && batch.length > 0);
                 }
             }
         } else if (dataTransfer.files && dataTransfer.files.length > 0) {
@@ -194,6 +388,32 @@ export default function MedicalViewer() {
         }
         return files;
     };
+
+    // ── Calculate Comfortable Auto-Fit Zoom for Viewport ──────────────────────
+    const getFitZoom = (parsed, isSplit = false) => {
+        if (!parsed) return 1;
+        const cols = parsed.cols || 256;
+        const rows = parsed.rows || 256;
+        const container = containerRef.current;
+        const availW = container ? ((container.clientWidth / (isSplit ? 2 : 1)) - 60) : 800;
+        const availH = container ? (container.clientHeight - 60) : 600;
+        const scale = Math.min(availW / cols, availH / rows);
+        // Default to a generous scale so scans (often 256x216) fill ~80% of the screen immediately
+        return Math.max(1.8, Math.min(6.0, +(scale * 0.88).toFixed(2)));
+    };
+
+    // ── Auto-fit Zoom when Scan or View changes ──────────────────────────────
+    useEffect(() => {
+        if (!parsedOriginal) return;
+        const timer = setTimeout(() => {
+            if (containerRef.current) {
+                const fit = getFitZoom(parsedOriginal, isSplitView);
+                setZoom(fit);
+                setPan({ x: 0, y: 0 });
+            }
+        }, 60);
+        return () => clearTimeout(timer);
+    }, [parsedOriginal, isSplitView]);
 
     // ── Select an Active Series from the Browser ──────────────────────────────
     const selectSeries = (series) => {
@@ -205,7 +425,8 @@ export default function MedicalViewer() {
         setCurrentTimeFrame(0);
         setWindowCenter(series.parsed.defaultWindowCenter);
         setWindowWidth(series.parsed.defaultWindowWidth);
-        setZoom(1);
+        const fit = getFitZoom(series.parsed, Boolean(series.localizedResult));
+        setZoom(fit);
         setPan({ x: 0, y: 0 });
         setIsPlayingCine(false);
 
@@ -252,137 +473,101 @@ export default function MedicalViewer() {
         }
     };
 
+    // ── Open a Specific Subfolder / Study from Hierarchy ─────────────────────
+    const handleOpenStudy = async (study) => {
+        if (!study) return;
+        setIsLoadingStudy(true);
+        setActiveStudyId(study.id);
+        setStatusMessage(`Loading ${study.name} (${study.imageCount} images)...`);
+
+        if (study.category) {
+            setExpandedStudies((prev) => new Set(prev).add(study.category));
+        }
+
+        try {
+            const seriesObj = await assembleSingleStudy(study);
+            if (!seriesObj) {
+                setErrorMessage(`Failed to assemble images for ${study.name}`);
+                setIsLoadingStudy(false);
+                return;
+            }
+
+            // Link matching GT mask if available in hierarchy
+            if (patientHierarchy?.studies) {
+                const base = getBaseScanName(study.name).toLowerCase();
+                const gtStudy = patientHierarchy.studies.find(
+                    (s) => isGroundTruthMask(s.name) && getBaseScanName(s.name).toLowerCase() === base
+                );
+                if (gtStudy && gtStudy.id !== study.id) {
+                    const gtSeries = await assembleSingleStudy(gtStudy);
+                    if (gtSeries) {
+                        seriesObj.gtMask = gtSeries;
+                        seriesObj.hasGtMask = true;
+                    }
+                }
+            }
+
+            // Keep loaded studies in seriesList so filmstrip and selector can switch between them
+            setSeriesList((prev) => {
+                const existingIdx = prev.findIndex((s) => s.id === seriesObj.id);
+                if (existingIdx >= 0) {
+                    const copy = [...prev];
+                    copy[existingIdx] = seriesObj;
+                    return copy;
+                }
+                return [...prev, seriesObj];
+            });
+
+            selectSeries(seriesObj);
+            const isCineScan = seriesObj.parsed?.isCine && !/localizer|scout/i.test(study.name);
+            const phaseSuffix = isCineScan && seriesObj.numTimeFrames > 1
+                ? ` • ${seriesObj.numTimeFrames} CINE Phases`
+                : (seriesObj.parsed?.isT1Mapping && seriesObj.numTimeFrames > 1 ? ` • ${seriesObj.numTimeFrames} TIs` : '');
+            setStatusMessage(`Active study: ${study.name} (${seriesObj.numSlices || 1} Slices${phaseSuffix})`);
+        } catch (err) {
+            console.error('Error opening study:', err);
+            setErrorMessage(`Error loading ${study.name}: ${err.message}`);
+        } finally {
+            setIsLoadingStudy(false);
+        }
+    };
+
     // ── Batch & Folder Files Processing ────────────────────────────────────────
     const processUploadedFiles = async (fileList) => {
         if (!fileList || fileList.length === 0) return;
         setErrorMessage('');
         setClinicalData(null);
+        setSeriesList([]);
 
-        const filesArray = Array.from(fileList);
-        const medicalFiles = filesArray.filter((f) => {
-            const name = f.name.toLowerCase();
-            return (
-                name.endsWith('.nii') ||
-                name.endsWith('.nii.gz') ||
-                name.endsWith('.dcm') ||
-                name.endsWith('.dicom')
-            );
-        });
+        setStatusMessage('Scanning patient directory structure...');
 
-        if (medicalFiles.length === 0) {
-            setErrorMessage('No valid medical files (.nii, .nii.gz, .dcm) found in the selected folder/files.');
-            return;
-        }
-
-        // Sort files naturally by name
-        medicalFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
-
-        setStatusMessage(`Parsing ${medicalFiles.length} scan${medicalFiles.length > 1 ? 's' : ''}...`);
-
-        // Detect study / patient folder name
-        const firstFile = medicalFiles[0];
-        let detectedPatient = 'Patient Study';
-        if (firstFile.webkitRelativePath && firstFile.webkitRelativePath.includes('/')) {
-            detectedPatient = firstFile.webkitRelativePath.split('/')[0];
-        } else {
-            const match = firstFile.name.match(/^([A-Za-z0-9_]+?)(?:_SA|_LA|_2CH|_4CH|_LGE|_CINE|\.nii|\.dcm)/i);
-            if (match && match[1]) {
-                detectedPatient = `Patient ${match[1].replace(/_/g, ' ')}`;
-            } else {
-                detectedPatient = firstFile.name.replace(/\.[^/.]+$/, '');
+        try {
+            const hierarchy = await buildHierarchicalStudyTree(fileList);
+            if (!hierarchy || !hierarchy.studies || hierarchy.studies.length === 0) {
+                setErrorMessage('No valid medical files (.nii, .nii.gz, .dcm) found in the selected folder.');
+                setStatusMessage('');
+                return;
             }
-        }
-        setPatientStudyName(detectedPatient);
 
-        const niftiFiles = medicalFiles.filter((f) => {
-            const name = f.name.toLowerCase();
-            return name.endsWith('.nii') || name.endsWith('.nii.gz');
-        });
-        const dicomFiles = medicalFiles.filter((f) => {
-            const name = f.name.toLowerCase();
-            return name.endsWith('.dcm') || name.endsWith('.dicom');
-        });
+            setPatientHierarchy(hierarchy);
+            setPatientStudyName(hierarchy.patientName);
+            setSidebarTab('folders');
+            setIsSidebarOpen(true);
 
-        const newSeries = [];
+            // Folders start completely collapsed — user opens only what they choose
+            setExpandedStudies(new Set());
 
-        // 1. Group & assemble multi-file DICOM series (e.g. 01_bSSFP_Cine, 02_T1_Mapping, etc.)
-        if (dicomFiles.length > 0) {
-            setStatusMessage(`Grouping & assembling ${dicomFiles.length} DICOM files...`);
-            const assembled = await groupAndAssembleDicomFiles(dicomFiles);
-            newSeries.push(...assembled);
-        }
-
-        // 2. Process NIfTI files
-        for (let i = 0; i < niftiFiles.length; i++) {
-            const file = niftiFiles[i];
-            try {
-                const buffer = await file.arrayBuffer();
-                const parsed = await parseMedicalFile(buffer, file.name);
-                const thumb = generateThumbnailUrl(parsed);
-                const seq = getSequenceFriendlyName(file.name);
-                newSeries.push({
-                    id: `${file.name}_${file.size}_${i}`,
-                    file,
-                    filename: file.name,
-                    parsed,
-                    thumbnailUrl: thumb,
-                    numSlices: parsed.numSlices,
-                    numTimeFrames: parsed.numTimeFrames,
-                    cols: parsed.cols,
-                    rows: parsed.rows,
-                    type: parsed.type,
-                    viewType: seq.name,
-                    hasLocalization: false,
-                    localizedResult: null
-                });
-            } catch (err) {
-                console.warn(`Error parsing ${file.name}:`, err);
-            }
-        }
-
-        // Link Ground Truth masks to matching anatomical scans
-        const maskMap = new Map();
-        for (const s of newSeries) {
-            if (isGroundTruthMask(s.filename)) {
-                const base = getBaseScanName(s.filename).toLowerCase();
-                maskMap.set(base, s);
-                s.isGroundTruth = true;
-            }
-        }
-
-        for (const s of newSeries) {
-            if (!isGroundTruthMask(s.filename)) {
-                const base = getBaseScanName(s.filename).toLowerCase();
-                if (maskMap.has(base)) {
-                    const matchedGt = maskMap.get(base);
-                    s.gtMask = matchedGt;
-                    s.hasGtMask = true;
-                }
-            }
-        }
-
-        if (newSeries.length === 0) {
-            setErrorMessage('Failed to parse the selected medical scans.');
+            // Do not display any scan automatically — wait until user explicitly selects a scan
+            setActiveStudyId(null);
+            setParsedOriginal(null);
+            setParsedLocalized(null);
+            setRawFile(null);
+            setStatusMessage(`Loaded patient hierarchy (${hierarchy.studies.length} scans). Select a scan to view.`);
+        } catch (err) {
+            console.error('Error organizing patient studies:', err);
+            setErrorMessage(`Failed to organize patient studies: ${err.message}`);
             setStatusMessage('');
-            return;
         }
-
-        // Auto-select the first anatomical scan so user starts on image rather than an isolated mask
-        const firstAnatomical = newSeries.find((s) => !isGroundTruthMask(s.filename)) || newSeries[0];
-
-        // Refine patient/study name if authoritative DICOM tags exist
-        const firstDicom = newSeries.find((s) => s.type === 'dicom');
-        if (firstDicom && firstDicom.parsed?.metadata?.PatientName && firstDicom.parsed.metadata.PatientName !== 'Anonymous' && firstDicom.parsed.metadata.PatientName !== 'N/A') {
-            detectedPatient = firstDicom.parsed.metadata.PatientName.replace(/\^/g, ' ').trim();
-        } else if (firstDicom && firstDicom.parsed?.metadata?.StudyDescription && firstDicom.parsed.metadata.StudyDescription !== 'N/A') {
-            detectedPatient = firstDicom.parsed.metadata.StudyDescription.trim();
-        }
-        setPatientStudyName(detectedPatient);
-
-        setSeriesList(newSeries);
-        setShowSeriesBrowser(true);
-        selectSeries(firstAnatomical);
-        setStatusMessage(`Loaded ${newSeries.length} scans for ${detectedPatient}`);
     };
 
     const handleFileChange = (e) => {
@@ -635,8 +820,8 @@ export default function MedicalViewer() {
         if (!parsedOriginal) return;
         e.preventDefault();
         if (e.ctrlKey || activeTool === 'zoom') {
-            const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
-            setZoom((prev) => Math.max(0.2, Math.min(10, +(prev * zoomFactor).toFixed(3))));
+            const zoomFactor = e.deltaY < 0 ? 1.08 : 0.92;
+            setZoom((prev) => Math.max(0.6, Math.min(10, +(prev * zoomFactor).toFixed(3))));
         } else if (parsedOriginal) {
             if (e.shiftKey && (parsedOriginal.numTimeFrames || 1) > 1) {
                 if (e.deltaY > 0) {
@@ -659,12 +844,12 @@ export default function MedicalViewer() {
     };
 
     const handleZoomOut = () => {
-        setZoom((prev) => Math.max(0.2, +(prev / 1.25).toFixed(2)));
+        setZoom((prev) => Math.max(0.6, +(prev / 1.25).toFixed(2)));
     };
 
     const handleResetView = () => {
         if (!parsedOriginal) return;
-        setZoom(1);
+        setZoom(getFitZoom(parsedOriginal, isSplitView));
         setPan({ x: 0, y: 0 });
         setWindowCenter(parsedOriginal.defaultWindowCenter);
         setWindowWidth(parsedOriginal.defaultWindowWidth);
@@ -672,289 +857,256 @@ export default function MedicalViewer() {
 
     return (
         <div className="flex flex-col h-screen bg-[#070b12] text-slate-100 font-sans select-none overflow-hidden">
-            {/* ── TOP HEADER / NAVBAR ────────────────────────────────────────────── */}
-            <header className="h-14 bg-gradient-to-r from-[#0b1018] via-[#0f1724] to-[#0b1018] border-b border-slate-800/80 px-5 flex items-center justify-between shadow-xl z-20">
-                <div className="flex items-center space-x-4">
-                    <div className="flex items-center space-x-2.5 bg-gradient-to-r from-cyan-600 via-blue-600 to-indigo-600 px-3.5 py-1.5 rounded-xl text-white font-bold tracking-wide shadow-lg ring-1 ring-cyan-400/30 text-sm">
-                        <Activity className="w-4 h-4 text-cyan-200 animate-pulse" />
-                        <span className="font-extrabold tracking-wider">CARDIAC MRI WORKSTATION</span>
-                    </div>
-                    <div className="hidden sm:flex items-center space-x-2 text-xs text-slate-400 border-l border-slate-800 pl-4 font-mono">
-                        <Layers className="w-3.5 h-3.5 text-cyan-400" />
-                        <span>LV Localization & Myocardial Viability</span>
-                    </div>
+            {/* ── TOP HEADER ── */}
+            <header className="h-10 bg-[#0d1b2a] border-b border-white/10 px-4 flex items-center justify-between z-20">
+                <div className="flex items-center gap-3">
+                    <span className="text-sm font-semibold text-white/80 tracking-wide font-mono">Cardiac MRI</span>
+                    <span className="hidden sm:block text-[11px] text-white/25 font-mono border-l border-white/10 pl-3">
+                        LV Localization & Myocardial Viability
+                    </span>
                 </div>
 
-                {/* Status notifications & Backend indicator */}
-                <div className="flex items-center space-x-3">
+                <div className="flex items-center gap-2">
                     {statusMessage && (
-                        <div className="flex items-center space-x-2 text-xs text-emerald-300 bg-emerald-950/60 border border-emerald-700/50 px-3 py-1 rounded-full shadow-sm animate-fade-in">
-                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                            <span className="font-medium">{statusMessage}</span>
-                        </div>
+                        <span className="text-[11px] text-white/50 font-mono">{statusMessage}</span>
                     )}
                     {errorMessage && (
-                        <div className="flex items-center space-x-2 text-xs text-rose-300 bg-rose-950/60 border border-rose-700/50 px-3 py-1 rounded-full shadow-sm animate-fade-in">
-                            <AlertCircle className="w-3.5 h-3.5 text-rose-400" />
-                            <span className="font-medium">{errorMessage}</span>
-                        </div>
+                        <span className="text-[11px] text-rose-400/70 font-mono">{errorMessage}</span>
                     )}
-
-                    <div className="flex items-center space-x-2 bg-slate-900/90 border border-slate-800 px-3 py-1 rounded-full text-xs font-mono shadow-inner">
-                        <span className={`w-2 h-2 rounded-full ${backendStatus === 'online' ? 'bg-emerald-400 shadow-emerald-400/50 shadow-sm' : backendStatus === 'checking' ? 'bg-amber-400 animate-ping' : 'bg-rose-500'}`} />
-                        <span className="text-slate-400">FastAPI API: <strong className={backendStatus === 'online' ? 'text-emerald-400' : 'text-slate-200'}>{backendStatus.toUpperCase()}</strong></span>
+                    <div className="flex items-center gap-1.5 text-[11px] font-mono text-white/30">
+                        <span className={`w-1.5 h-1.5 rounded-full ${backendStatus === 'online' ? 'bg-white/50' : backendStatus === 'checking' ? 'bg-white/30 animate-pulse' : 'bg-rose-500/50'}`} />
+                        <span>API: {backendStatus}</span>
                     </div>
-
                     <button
                         onClick={() => setShowShortcutsModal(true)}
-                        className="p-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-cyan-300 border border-slate-800 transition"
-                        title="Keyboard Shortcuts & Help"
+                        className="p-1 rounded hover:bg-white/5 text-white/25 hover:text-white/60 transition"
+                        title="Keyboard shortcuts"
                     >
-                        <HelpCircle className="w-4 h-4" />
+                        <HelpCircle className="w-3.5 h-3.5" />
                     </button>
                 </div>
             </header>
 
-            {/* ── CONTROL TOOLBAR ───────────────────────────────────────────────── */}
-            <div className="h-14 bg-[#0d1420] border-b border-slate-800/80 px-4 flex items-center justify-between text-xs relative z-40 shadow-md gap-3 select-none">
-                {/* Left Controls Group */}
-                <div className="flex items-center space-x-2 flex-shrink-0">
-                    {/* Hidden Inputs for Files and Folders */}
-                    <input
-                        type="file"
-                        ref={fileInputRef}
-                        onChange={handleFileChange}
-                        accept=".dcm,.dicom,.nii,.nii.gz"
-                        multiple
-                        className="hidden"
-                    />
-                    <input
-                        type="file"
-                        ref={folderInputRef}
-                        onChange={handleFolderChange}
-                        webkitdirectory="true"
-                        directory=""
-                        multiple
-                        className="hidden"
-                    />
+            {/* ── CONTROL TOOLBAR ── */}
+            <div className="h-11 bg-[#0d1b2a] border-b border-white/10 px-3 flex items-center justify-between text-xs z-40 gap-2 select-none">
+                {/* Left group */}
+                <div className="flex items-center gap-1.5 flex-shrink-0">
+                    {/* Hidden file inputs */}
+                    <input type="file" ref={fileInputRef} onChange={handleFileChange} accept=".dcm,.dicom,.nii,.nii.gz" multiple className="hidden" />
+                    <input type="file" ref={folderInputRef} onChange={handleFolderChange} webkitdirectory="true" directory="" multiple className="hidden" />
 
-                    {/* Consolidated Upload Dropdown */}
+                    {/* Upload dropdown */}
                     <div ref={uploadMenuRef} className="relative z-50 flex-shrink-0">
                         <button
                             onClick={() => setIsUploadMenuOpen((prev) => !prev)}
-                            className="flex items-center space-x-1.5 bg-gradient-to-r from-cyan-600 via-cyan-500 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white px-3 py-1.5 rounded-lg shadow-md font-semibold transition transform active:scale-95 cursor-pointer ring-1 ring-cyan-400/30 whitespace-nowrap"
-                            title="Upload Cardiac MRI Scans or Patient Folders"
+                            className="flex items-center gap-1 border border-white/15 hover:border-white/30 text-white/60 hover:text-white/90 px-2.5 py-1 rounded font-mono transition"
                         >
-                            <Upload className="w-3.5 h-3.5 text-cyan-100" />
+                            <Upload className="w-3.5 h-3.5" />
                             <span>Upload</span>
-                            <ChevronDown className={`w-3.5 h-3.5 opacity-80 transition-transform ${isUploadMenuOpen ? 'rotate-180' : ''}`} />
+                            <ChevronDown className={`w-3 h-3 opacity-50 transition-transform ${isUploadMenuOpen ? 'rotate-180' : ''}`} />
                         </button>
 
                         {isUploadMenuOpen && (
-                            <div className="absolute top-full left-0 mt-2 w-56 bg-[#0c131d] border border-cyan-500/50 rounded-xl shadow-2xl z-50 py-1.5 text-xs backdrop-blur-xl ring-1 ring-cyan-500/30">
+                            <div className="absolute top-full left-0 mt-1 w-48 bg-[#152238] border border-white/15 rounded shadow-xl z-50 py-1 text-xs">
                                 <button
-                                    onClick={() => {
-                                        setIsUploadMenuOpen(false);
-                                        fileInputRef.current?.click();
-                                    }}
-                                    className="w-full text-left px-3.5 py-2.5 text-slate-200 hover:bg-cyan-950 hover:text-cyan-300 flex items-center space-x-2.5 transition font-medium border-b border-slate-800/80 cursor-pointer"
+                                    onClick={() => { setIsUploadMenuOpen(false); fileInputRef.current?.click(); }}
+                                    className="w-full text-left px-3 py-2 text-white/60 hover:bg-white/5 hover:text-white/90 flex items-center gap-2 transition border-b border-white/5"
                                 >
-                                    <Upload className="w-4 h-4 text-cyan-400 flex-shrink-0" />
+                                    <Upload className="w-3.5 h-3.5 flex-shrink-0" />
                                     <div>
-                                        <div className="font-semibold text-white">Upload Scan(s)</div>
-                                        <div className="text-[10px] text-slate-400">Single or multiple .nii, .dcm</div>
+                                        <div className="font-medium text-white/80">Upload Scan(s)</div>
+                                        <div className="text-[10px] text-white/30">.nii, .dcm</div>
                                     </div>
                                 </button>
                                 <button
-                                    onClick={() => {
-                                        setIsUploadMenuOpen(false);
-                                        folderInputRef.current?.click();
-                                    }}
-                                    className="w-full text-left px-3.5 py-2.5 text-slate-200 hover:bg-amber-950/60 hover:text-amber-300 flex items-center space-x-2.5 transition font-medium cursor-pointer"
+                                    onClick={() => { setIsUploadMenuOpen(false); folderInputRef.current?.click(); }}
+                                    className="w-full text-left px-3 py-2 text-white/60 hover:bg-white/5 hover:text-white/90 flex items-center gap-2 transition"
                                 >
-                                    <FolderOpen className="w-4 h-4 text-amber-400 flex-shrink-0" />
+                                    <FolderOpen className="w-3.5 h-3.5 flex-shrink-0" />
                                     <div>
-                                        <div className="font-semibold text-amber-200">Upload Patient Folder</div>
-                                        <div className="text-[10px] text-slate-400">Multi-series & views</div>
+                                        <div className="font-medium text-white/80">Patient Folder</div>
+                                        <div className="text-[10px] text-white/30">Multi-series</div>
                                     </div>
                                 </button>
                             </div>
                         )}
                     </div>
 
-                    {/* Series Explorer Toggle Button */}
-                    {seriesList.length > 0 && (
+                    {/* Quick folder dropdown */}
+                    {patientHierarchy?.studies?.length > 0 && (
+                        <div ref={folderDropdownRef} className="relative z-50 flex-shrink-0">
+                            <button
+                                onClick={() => setIsFolderDropdownOpen((prev) => !prev)}
+                                className="flex items-center gap-1.5 border border-white/10 hover:border-white/25 text-white/55 hover:text-white/80 px-2.5 py-1 rounded font-mono transition"
+                            >
+                                <Folder className="w-3.5 h-3.5" />
+                                <span className="max-w-[120px] truncate">{activeStudyObj?.name || 'Folders'}</span>
+                                {activeStudyObj && <span className="text-white/25 text-[10px]">({activeStudyObj.imageCount})</span>}
+                                <ChevronDown className={`w-3 h-3 opacity-40 transition-transform ${isFolderDropdownOpen ? 'rotate-180' : ''}`} />
+                            </button>
+
+                            {isFolderDropdownOpen && (
+                                <div className="absolute top-full left-0 mt-1 w-60 bg-[#152238] border border-white/15 rounded shadow-xl z-50 py-1 text-xs max-h-72 overflow-y-auto">
+                                    <div className="px-3 py-1.5 text-[10px] text-white/25 font-mono border-b border-white/5 flex justify-between">
+                                        <span>Subfolders</span>
+                                        <span>{patientHierarchy.studies.length}</span>
+                                    </div>
+                                    {Array.from(categoriesMap.entries()).map(([catName, catStudies]) => (
+                                        <React.Fragment key={catName}>
+                                            <div className="px-3 py-1 text-[9px] uppercase tracking-wider text-white/30 font-mono bg-white/5 border-y border-white/5">
+                                                {catName.replace(/^\d+[_\-\s]/, '').replace(/_/g, ' ')}
+                                            </div>
+                                            {catStudies.map((study) => (
+                                                <button
+                                                    key={study.id}
+                                                    onClick={() => { setIsFolderDropdownOpen(false); handleOpenStudy(study); }}
+                                                    className={`w-full text-left pl-5 pr-3 py-1.5 flex items-center justify-between transition cursor-pointer text-xs ${
+                                                        study.id === activeStudyId
+                                                            ? 'bg-white/10 text-white font-medium border-l border-white/40'
+                                                            : 'text-white/50 hover:bg-white/5 hover:text-white/80'
+                                                    }`}
+                                                >
+                                                    <span className="truncate pr-2">{study.name}</span>
+                                                    <span className="text-[9px] text-white/25 flex-shrink-0">{study.imageCount} imgs</span>
+                                                </button>
+                                            ))}
+                                        </React.Fragment>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Folders sidebar toggle */}
+                    {patientHierarchy?.studies?.length > 0 && (
                         <button
-                            onClick={() => setShowSeriesBrowser(!showSeriesBrowser)}
-                            className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg font-semibold border transition flex-shrink-0 whitespace-nowrap cursor-pointer ${
-                                showSeriesBrowser
-                                    ? 'bg-cyan-950 text-cyan-300 border-cyan-500/80 shadow-md ring-1 ring-cyan-500/40'
-                                    : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800 hover:text-white'
+                            onClick={() => { setIsSidebarOpen((prev) => !prev); setSidebarTab('folders'); }}
+                            className={`flex items-center gap-1 px-2.5 py-1 rounded border font-mono transition flex-shrink-0 ${
+                                isSidebarOpen && sidebarTab === 'folders'
+                                    ? 'bg-white/10 border-white/25 text-white/80'
+                                    : 'border-white/10 text-white/40 hover:border-white/25 hover:text-white/70'
                             }`}
-                            title="Toggle Studies & Series Explorer (Bottom Filmstrip)"
                         >
-                            <Layers className="w-3.5 h-3.5 text-cyan-400" />
-                            <span>Series</span>
-                            <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-cyan-500 text-black font-extrabold">
-                                {seriesList.length}
-                            </span>
+                            <Folder className="w-3.5 h-3.5" />
+                            <span>Folders</span>
+                            <span className="text-[10px] text-white/30">({patientHierarchy.studies.length})</span>
                         </button>
                     )}
 
-                    <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
-
-                    {/* Send to Localizer Button */}
+                    {/* Run Localizer */}
                     <button
                         onClick={handleSendToLocalizer}
                         disabled={!parsedOriginal || isLoadingLocalizer}
-                        className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg font-bold transition shadow-lg active:scale-95 flex-shrink-0 whitespace-nowrap cursor-pointer ${
+                        className={`flex items-center gap-1.5 px-3 py-1 rounded border font-mono transition flex-shrink-0 ${
                             !parsedOriginal || isLoadingLocalizer
-                                ? 'bg-slate-900 text-slate-500 cursor-not-allowed border border-slate-800'
-                                : 'bg-gradient-to-r from-emerald-600 via-teal-500 to-emerald-500 hover:from-emerald-500 hover:to-teal-400 text-white ring-2 ring-emerald-400/40 glow-emerald'
+                                ? 'border-white/8 text-white/20 cursor-not-allowed'
+                                : 'border-white/20 text-white/60 hover:border-white/40 hover:text-white/90'
                         }`}
-                        title="Run Deep Learning Left Ventricle Localizer"
                     >
                         {isLoadingLocalizer ? (
                             <>
-                                <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                                <span>Localizing ROI...</span>
+                                <div className="w-3 h-3 border border-white/40 border-t-transparent rounded-full animate-spin" />
+                                <span>Localizing...</span>
                             </>
                         ) : (
-                            <>
-                                <Zap className="w-3.5 h-3.5 fill-amber-300 text-amber-300" />
-                                <span>Run Localizer</span>
-                            </>
+                            <span>Run Localizer</span>
                         )}
                     </button>
 
-                    <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
+                    <div className="h-5 w-px bg-white/8 mx-0.5 flex-shrink-0" />
 
-                    {/* Assess Myocardial Viability Button */}
+                    {/* Assess Viability */}
                     <button
                         id="workstation-assess-viability-btn"
                         onClick={handleAssessViability}
                         disabled={!parsedOriginal}
-                        className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg font-bold transition shadow-lg active:scale-95 flex-shrink-0 whitespace-nowrap cursor-pointer ${
+                        className={`flex items-center gap-1.5 px-3 py-1 rounded border font-mono transition flex-shrink-0 ${
                             !parsedOriginal
-                                ? 'bg-slate-900 text-slate-500 cursor-not-allowed border border-slate-800'
-                                : 'bg-gradient-to-r from-rose-700 via-red-600 to-rose-600 hover:from-rose-600 hover:to-red-500 text-white ring-2 ring-rose-500/40 shadow-rose-950/50'
+                                ? 'border-white/8 text-white/20 cursor-not-allowed'
+                                : 'border-white/20 text-white/60 hover:border-white/40 hover:text-white/90'
                         }`}
-                        title="Assess Myocardial Viability for this scan with Gemini AI Chatbot"
                     >
-                        <HeartPulse className="w-3.5 h-3.5 text-rose-200 fill-rose-300/20" />
                         <span>Assess Viability</span>
                     </button>
 
-                    <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
+                    <div className="h-5 w-px bg-white/8 mx-0.5 flex-shrink-0" />
 
-                    {/* View Modes Toggle */}
-                    <div className="flex items-center bg-slate-900/90 p-1 rounded-lg border border-slate-800 space-x-1 flex-shrink-0 whitespace-nowrap">
+                    {/* Single / Split view */}
+                    <div className="flex items-center bg-white/5 rounded border border-white/8 overflow-hidden flex-shrink-0">
                         <button
                             onClick={() => setIsSplitView(false)}
                             disabled={!parsedOriginal}
-                            className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-md font-medium transition whitespace-nowrap cursor-pointer ${
-                                !isSplitView
-                                    ? 'bg-cyan-950 text-cyan-300 border border-cyan-700/60 shadow-sm'
-                                    : 'text-slate-400 hover:text-slate-200'
-                            } ${!parsedOriginal ? 'opacity-50 cursor-not-allowed' : ''}`}
-                            title="Single Viewport Mode"
+                            className={`flex items-center gap-1 px-2.5 py-1 font-mono transition ${
+                                !isSplitView ? 'bg-white/10 text-white/80' : 'text-white/35 hover:text-white/60'
+                            } ${!parsedOriginal ? 'opacity-30 cursor-not-allowed' : ''}`}
                         >
                             <Square className="w-3.5 h-3.5" />
                             <span>Single</span>
                         </button>
-
                         <button
                             onClick={() => setIsSplitView(true)}
                             disabled={!parsedLocalized}
-                            className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-md font-medium transition whitespace-nowrap cursor-pointer ${
-                                isSplitView
-                                    ? 'bg-cyan-950 text-cyan-300 border border-cyan-700/60 shadow-sm'
-                                    : 'text-slate-400 hover:text-slate-200'
-                            } ${!parsedLocalized ? 'opacity-50 cursor-not-allowed' : ''}`}
-                            title={parsedLocalized ? "Split View (1×2) - Original vs Localized ROI" : "Run Localizer to enable Split View"}
+                            className={`flex items-center gap-1 px-2.5 py-1 font-mono transition border-l border-white/8 ${
+                                isSplitView ? 'bg-white/10 text-white/80' : 'text-white/35 hover:text-white/60'
+                            } ${!parsedLocalized ? 'opacity-30 cursor-not-allowed' : ''}`}
                         >
                             <Columns className="w-3.5 h-3.5" />
                             <span>Split 1×2</span>
                         </button>
                     </div>
 
-                    {/* Download Localized Result Button */}
+                    {/* Export (only when localized) */}
                     {parsedLocalized && (
                         <div ref={downloadMenuRef} className="relative z-50 flex-shrink-0">
                             <button
                                 onClick={() => setIsDownloadMenuOpen(!isDownloadMenuOpen)}
-                                className="flex items-center space-x-1 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white px-2.5 py-1.5 rounded-lg font-semibold text-xs shadow-lg transition active:scale-95 cursor-pointer ring-1 ring-emerald-400/40 whitespace-nowrap"
-                                title="Download Localized Output"
+                                className="flex items-center gap-1 border border-white/15 hover:border-white/30 text-white/50 hover:text-white/80 px-2.5 py-1 rounded font-mono transition"
                             >
                                 <Download className="w-3.5 h-3.5" />
                                 <span>Export</span>
-                                <ChevronDown className="w-3 h-3 ml-0.5 opacity-80" />
+                                <ChevronDown className="w-3 h-3 opacity-40 ml-0.5" />
                             </button>
 
                             {isDownloadMenuOpen && (
-                                <div className="absolute top-full left-0 mt-2 w-52 bg-[#0c131d] border border-cyan-500/50 rounded-xl shadow-2xl z-50 py-1.5 text-xs backdrop-blur-xl ring-1 ring-cyan-500/30">
-                                    <div className="px-3 py-1.5 text-[10px] uppercase font-bold text-cyan-400 tracking-wider border-b border-slate-800">
-                                        Select Export Format
-                                    </div>
-                                    <button
-                                        onClick={() => handleDownloadLocalized('dicom')}
-                                        className="w-full text-left px-3.5 py-2 text-slate-200 hover:bg-cyan-950 hover:text-cyan-300 flex items-center justify-between transition font-medium"
-                                    >
-                                        <span>DICOM File</span>
-                                        <span className="text-[10px] text-cyan-400 font-mono bg-cyan-950/80 px-1.5 py-0.5 rounded border border-cyan-800">.dcm</span>
+                                <div className="absolute top-full left-0 mt-1 w-48 bg-[#152238] border border-white/15 rounded shadow-xl z-50 py-1 text-xs">
+                                    <div className="px-3 py-1.5 text-[10px] text-white/25 font-mono border-b border-white/5">Export Format</div>
+                                    <button onClick={() => handleDownloadLocalized('dicom')} className="w-full text-left px-3 py-2 text-white/60 hover:bg-white/5 hover:text-white/90 flex justify-between transition font-mono">
+                                        <span>DICOM</span><span className="text-white/25">.dcm</span>
                                     </button>
-                                    <button
-                                        onClick={() => handleDownloadLocalized('nifti')}
-                                        className="w-full text-left px-3.5 py-2 text-slate-200 hover:bg-cyan-950 hover:text-cyan-300 flex items-center justify-between transition font-medium"
-                                    >
-                                        <span>NIfTI Volume</span>
-                                        <span className="text-[10px] text-teal-400 font-mono bg-teal-950/80 px-1.5 py-0.5 rounded border border-teal-800">.nii.gz</span>
+                                    <button onClick={() => handleDownloadLocalized('nifti')} className="w-full text-left px-3 py-2 text-white/60 hover:bg-white/5 hover:text-white/90 flex justify-between transition font-mono">
+                                        <span>NIfTI</span><span className="text-white/25">.nii.gz</span>
                                     </button>
-                                    <button
-                                        onClick={() => handleDownloadLocalized('png')}
-                                        className="w-full text-left px-3.5 py-2 text-slate-200 hover:bg-cyan-950 hover:text-cyan-300 flex items-center justify-between transition border-t border-slate-800/80 font-medium"
-                                    >
-                                        <span>Slice Image (PNG)</span>
-                                        <span className="text-[10px] text-slate-400 font-mono bg-slate-900 px-1.5 py-0.5 rounded border border-slate-700">.png</span>
+                                    <button onClick={() => handleDownloadLocalized('png')} className="w-full text-left px-3 py-2 text-white/60 hover:bg-white/5 hover:text-white/90 flex justify-between transition border-t border-white/5 font-mono">
+                                        <span>PNG Slice</span><span className="text-white/25">.png</span>
                                     </button>
                                 </div>
                             )}
                         </div>
                     )}
 
-                    {/* ── GROUND TRUTH MASK OVERLAY CONTROLS (Only visible if a matching GT mask exists) ── */}
+                    {/* GT Mask controls */}
                     {hasMatchingGt && (
                         <>
-                            <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
-                            <div className="flex items-center bg-slate-900/90 p-1 rounded-lg border border-slate-800 space-x-1.5 flex-shrink-0 whitespace-nowrap">
+                            <div className="h-5 w-px bg-white/8 mx-0.5 flex-shrink-0" />
+                            <div className="flex items-center bg-white/5 rounded border border-white/8 px-1 gap-1 flex-shrink-0">
                                 <button
                                     onClick={() => setSelectedMaskType((prev) => (prev === 'gt' ? 'none' : 'gt'))}
-                                    className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
-                                        selectedMaskType === 'gt'
-                                            ? 'bg-emerald-950 text-emerald-300 border border-emerald-600/70 shadow-sm'
-                                            : 'text-slate-400 hover:text-slate-200'
+                                    className={`flex items-center gap-1 px-2 py-1 rounded font-mono text-xs transition cursor-pointer ${
+                                        selectedMaskType === 'gt' ? 'bg-white/10 text-white/80' : 'text-white/35 hover:text-white/60'
                                     }`}
-                                    title={selectedMaskType === 'gt' ? "Hide Ground Truth Mask Overlay" : "Show Ground Truth Mask Overlay"}
                                 >
-                                    <ShieldCheck className={`w-3.5 h-3.5 ${selectedMaskType === 'gt' ? 'text-emerald-400' : 'text-slate-500'}`} />
-                                    <span>{selectedMaskType === 'gt' ? 'GT Mask: ON' : 'Show GT Mask'}</span>
+                                    <ShieldCheck className="w-3.5 h-3.5" />
+                                    <span>{selectedMaskType === 'gt' ? 'GT: ON' : 'GT Mask'}</span>
                                 </button>
-
                                 {selectedMaskType === 'gt' && (
-                                    <div className="flex items-center space-x-1.5 pl-1.5 pr-1 border-l border-slate-800">
+                                    <div className="flex items-center gap-1 pl-1 border-l border-white/8">
                                         <input
-                                            type="range"
-                                            min="0.1"
-                                            max="0.9"
-                                            step="0.05"
+                                            type="range" min="0.1" max="0.9" step="0.05"
                                             value={maskOpacity}
                                             onChange={(e) => setMaskOpacity(Number(e.target.value))}
-                                            className="w-12 accent-emerald-400 h-1 bg-slate-800 rounded cursor-pointer"
-                                            title={`Mask Opacity: ${Math.round(maskOpacity * 100)}%`}
+                                            className="w-12 accent-white h-1 bg-white/10 rounded cursor-pointer"
                                         />
-                                        <span className="text-[10px] text-slate-400 font-mono w-6 text-right">
-                                            {Math.round(maskOpacity * 100)}%
-                                        </span>
+                                        <span className="text-[10px] text-white/30 font-mono w-6">{Math.round(maskOpacity * 100)}%</span>
                                     </div>
                                 )}
                             </div>
@@ -962,103 +1114,53 @@ export default function MedicalViewer() {
                     )}
                 </div>
 
-                {/* Right Controls Group */}
-                <div className="flex items-center space-x-2 flex-shrink-0 whitespace-nowrap">
-                    {/* Interactive Tools (Pan, Zoom, Window) */}
-                    <div className="flex items-center bg-slate-900/90 p-1 rounded-lg border border-slate-800 space-x-1 flex-shrink-0">
+                {/* Right group: tools */}
+                <div className="flex items-center gap-1.5 flex-shrink-0">
+                    {/* Pan / Zoom / Window tools */}
+                    <div className="flex items-center bg-white/5 rounded border border-white/8 overflow-hidden">
                         <button
                             onClick={() => setActiveTool('pan')}
-                            className={`p-1.5 rounded-md transition cursor-pointer ${activeTool === 'pan' ? 'bg-cyan-900/70 text-cyan-300 border border-cyan-600/80 shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
-                            title="Pan Tool (Click and drag to position image)"
+                            className={`p-1.5 transition cursor-pointer ${activeTool === 'pan' ? 'bg-white/15 text-white' : 'text-white/35 hover:text-white/70'}`}
+                            title="Pan"
                         >
-                            <Move className="w-4 h-4" />
+                            <Move className="w-3.5 h-3.5" />
                         </button>
-
                         <button
                             onClick={() => setActiveTool('zoom')}
-                            className={`p-1.5 rounded-md transition cursor-pointer ${activeTool === 'zoom' ? 'bg-cyan-900/70 text-cyan-300 border border-cyan-600/80 shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
-                            title="Interactive Zoom Tool (Drag up/down or scroll wheel to zoom)"
+                            className={`p-1.5 transition cursor-pointer border-l border-white/8 ${activeTool === 'zoom' ? 'bg-white/15 text-white' : 'text-white/35 hover:text-white/70'}`}
+                            title="Zoom"
                         >
-                            <Search className="w-4 h-4" />
+                            <Search className="w-3.5 h-3.5" />
                         </button>
-
                         <button
                             onClick={() => setActiveTool('window')}
-                            className={`p-1.5 rounded-md transition cursor-pointer ${activeTool === 'window' ? 'bg-cyan-900/70 text-cyan-300 border border-cyan-600/80 shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
-                            title="Window / Level (Adjust brightness and contrast)"
+                            className={`p-1.5 transition cursor-pointer border-l border-white/8 ${activeTool === 'window' ? 'bg-white/15 text-white' : 'text-white/35 hover:text-white/70'}`}
+                            title="Window/Level"
                         >
-                            <Sun className="w-4 h-4" />
+                            <Sun className="w-3.5 h-3.5" />
                         </button>
                     </div>
 
-                    <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
+                    <div className="h-5 w-px bg-white/8 flex-shrink-0" />
 
-                    {/* Zoom & Reset Buttons */}
-                    <div className="flex items-center space-x-1 flex-shrink-0">
-                        <button
-                            onClick={handleZoomIn}
-                            disabled={!parsedOriginal}
-                            className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-cyan-300 disabled:opacity-40 transition cursor-pointer"
-                            title="Zoom In (+25%)"
-                        >
-                            <ZoomIn className="w-4 h-4" />
+                    {/* Zoom In/Out/Reset */}
+                    <div className="flex items-center gap-0.5">
+                        <button onClick={handleZoomIn} disabled={!parsedOriginal} className="p-1.5 rounded hover:bg-white/5 text-white/35 hover:text-white/70 disabled:opacity-20 transition" title="Zoom in">
+                            <ZoomIn className="w-3.5 h-3.5" />
                         </button>
-
-                        <button
-                            onClick={handleZoomOut}
-                            disabled={!parsedOriginal}
-                            className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-cyan-300 disabled:opacity-40 transition cursor-pointer"
-                            title="Zoom Out (-20%)"
-                        >
-                            <ZoomOut className="w-4 h-4" />
+                        <button onClick={handleZoomOut} disabled={!parsedOriginal} className="p-1.5 rounded hover:bg-white/5 text-white/35 hover:text-white/70 disabled:opacity-20 transition" title="Zoom out">
+                            <ZoomOut className="w-3.5 h-3.5" />
                         </button>
-
-                        <button
-                            onClick={handleResetView}
-                            disabled={!parsedOriginal}
-                            className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-cyan-300 disabled:opacity-40 transition cursor-pointer"
-                            title="Reset Zoom & Contrast"
-                        >
-                            <RotateCcw className="w-4 h-4" />
+                        <button onClick={handleResetView} disabled={!parsedOriginal} className="p-1.5 rounded hover:bg-white/5 text-white/35 hover:text-white/70 disabled:opacity-20 transition" title="Reset">
+                            <RotateCcw className="w-3.5 h-3.5" />
                         </button>
                     </div>
-
-                    <div className="h-6 w-px bg-slate-800 mx-0.5 flex-shrink-0" />
-
-                    {/* Patient Profile & Metadata */}
-                    <button
-                        onClick={() => { setShowClinicalPanel(prev => !prev); if (!showClinicalPanel) setShowMetadata(false); }}
-                        disabled={!parsedOriginal}
-                        className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border font-medium transition cursor-pointer flex-shrink-0 ${
-                            showClinicalPanel
-                                ? 'bg-cyan-600/30 border-cyan-500 text-cyan-300'
-                                : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
-                        }`}
-                        title="Toggle Patient Profile and Clinical Biomarkers"
-                    >
-                        <Activity className="w-3.5 h-3.5 text-cyan-400" />
-                        <span>Profile</span>
-                    </button>
-
-                    <button
-                        onClick={() => { setShowMetadata(prev => !prev); if (!showMetadata) setShowClinicalPanel(false); }}
-                        disabled={!parsedOriginal}
-                        className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg border font-medium transition cursor-pointer flex-shrink-0 ${
-                            showMetadata
-                                ? 'bg-blue-950 text-blue-300 border-blue-700/80 shadow-sm'
-                                : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800'
-                        } ${!parsedOriginal ? 'opacity-40 cursor-not-allowed' : ''}`}
-                        title="Toggle DICOM/NIfTI Header Metadata"
-                    >
-                        <FileText className="w-3.5 h-3.5 text-blue-400" />
-                        <span>Metadata</span>
-                    </button>
                 </div>
             </div>
 
-            {/* ── MAIN VIEWER VIEWPORTS AREA ────────────────────────────────────── */}
+            {/* ── MAIN VIEWER VIEWPORTS AREA (Full Height & Clear) ────────────────── */}
             <div
-                className="flex-1 flex overflow-hidden relative bg-[#05080e]"
+                className="flex-1 flex overflow-hidden relative bg-[#091422]"
                 onDragOver={(e) => {
                     e.preventDefault();
                     setIsDragOver(true);
@@ -1068,108 +1170,203 @@ export default function MedicalViewer() {
             >
                 {/* Drag & Drop Highlight Overlay */}
                 {isDragOver && (
-                    <div className="absolute inset-0 z-40 bg-cyan-950/80 backdrop-blur-md border-4 border-dashed border-cyan-400 flex flex-col items-center justify-center text-cyan-200 space-y-3">
-                        <Upload className="w-16 h-16 animate-bounce text-cyan-300" />
+                    <div className="absolute inset-0 z-40 bg-[#0d1b2a]/90 backdrop-blur-md border-4 border-dashed border-white/40 flex flex-col items-center justify-center text-white/70 space-y-3">
+                        <Upload className="w-16 h-16 animate-bounce text-white/60" />
                         <span className="text-xl font-bold tracking-wide">Drop DICOM or NIfTI File Here</span>
-                        <span className="text-xs text-cyan-400">Supports .dcm, .dicom, .nii, .nii.gz</span>
+                        <span className="text-xs text-white/40">Supports .dcm, .dicom, .nii, .nii.gz</span>
                     </div>
                 )}
 
-                {/* Side Drawer for Patient Profile & Clinical Labs (Left Side) */}
-                {showClinicalPanel && (
-                    <aside className="w-80 sm:w-96 bg-[#0a0f18] border-r border-slate-800/80 p-3 overflow-y-auto z-20 shadow-2xl flex flex-col">
-                        <ClinicalDataPanel
-                            clinicalData={clinicalData}
-                            onClose={handleCloseClinicalPanel}
-                        />
-                    </aside>
-                )}
-
-                {/* Side Drawer for Metadata */}
-                {showMetadata && parsedOriginal && (
-                    <aside className="w-80 bg-[#0a0f18] border-r border-slate-800/80 p-4 text-xs overflow-y-auto z-10 shadow-2xl font-mono">
-                        <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-800">
-                            <div className="flex items-center space-x-2 text-cyan-400 font-bold">
-                                <FileText className="w-4 h-4" />
-                                <span>DICOM / NIfTI HEADER</span>
+                {/* ── LEFT SIDEBAR (FOLDERS + PROFILE + TAGS) ── */}
+                {isSidebarOpen ? (
+                    <aside className="w-72 bg-[#091422] border-r border-white/10 flex flex-col z-20 shrink-0">
+                        {/* Sidebar Tab Header */}
+                        <div className="px-2 py-1.5 border-b border-white/10 flex items-center justify-between">
+                            <div className="flex items-center gap-0.5 text-[10px] font-mono">
+                                {patientHierarchy?.studies?.length > 0 && (
+                                    <button
+                                        onClick={() => setSidebarTab('folders')}
+                                        className={`px-2.5 py-1 rounded transition ${
+                                            sidebarTab === 'folders'
+                                                ? 'bg-white/10 text-white'
+                                                : 'text-white/40 hover:text-white/70'
+                                        }`}
+                                    >
+                                        Folders ({patientHierarchy.studies.length})
+                                    </button>
+                                )}
+                                <button
+                                    onClick={() => setSidebarTab('clinical')}
+                                    className={`px-2.5 py-1 rounded transition ${
+                                        sidebarTab === 'clinical'
+                                            ? 'bg-white/10 text-white'
+                                            : 'text-white/40 hover:text-white/70'
+                                    }`}
+                                >
+                                    Profile
+                                </button>
+                                {parsedOriginal && (
+                                    <button
+                                        onClick={() => setSidebarTab('metadata')}
+                                        className={`px-2.5 py-1 rounded transition ${
+                                            sidebarTab === 'metadata'
+                                                ? 'bg-white/10 text-white'
+                                                : 'text-white/40 hover:text-white/70'
+                                        }`}
+                                    >
+                                        Tags
+                                    </button>
+                                )}
                             </div>
+
                             <button
-                                onClick={() => setShowMetadata(false)}
-                                className="text-slate-400 hover:text-slate-200"
+                                onClick={() => setIsSidebarOpen(false)}
+                                className="p-1 rounded hover:bg-white/5 text-white/30 hover:text-white/70 transition"
+                                title="Collapse sidebar"
                             >
-                                <X className="w-4 h-4" />
+                                <ChevronLeft className="w-4 h-4" />
                             </button>
                         </div>
 
-                        <div className="space-y-3">
-                            <div className="bg-slate-900/80 p-2.5 rounded-lg border border-slate-800">
-                                <div className="text-[10px] uppercase text-slate-500 font-bold">Patient & File</div>
-                                <div className="text-slate-200 font-bold truncate mt-0.5">{rawFile?.name || 'Scan'}</div>
-                                <div className="text-cyan-400 text-[11px] mt-1">{parsedOriginal.type.toUpperCase()} Format</div>
-                            </div>
+                        {/* Tab 1: Folders */}
+                        {sidebarTab === 'folders' && patientHierarchy && (
+                            <div className="flex-1 flex flex-col overflow-hidden p-2 gap-1.5">
+                                <div className="relative">
+                                    <Search className="w-3 h-3 absolute left-2.5 top-1/2 -translate-y-1/2 text-white/25" />
+                                    <input
+                                        type="text"
+                                        value={subfolderFilter}
+                                        onChange={(e) => setSubfolderFilter(e.target.value)}
+                                        placeholder="Filter..."
+                                        className="w-full bg-white/5 border border-white/10 focus:border-white/30 rounded pl-7 pr-2 py-1 text-[11px] font-mono text-white/70 placeholder-white/20 focus:outline-none transition"
+                                    />
+                                    {subfolderFilter && (
+                                        <button
+                                            onClick={() => setSubfolderFilter('')}
+                                            className="absolute right-2 top-1/2 -translate-y-1/2 text-white/25 hover:text-white/60"
+                                        >
+                                            <X className="w-3 h-3" />
+                                        </button>
+                                    )}
+                                </div>
 
-                            <div className="bg-slate-900/80 p-2.5 rounded-lg border border-slate-800 space-y-1.5 text-slate-300">
-                                <div className="flex justify-between">
-                                    <span className="text-slate-500">Dimensions:</span>
-                                    <span>{parsedOriginal.cols} × {parsedOriginal.rows}</span>
-                                </div>
-                                <div className="flex justify-between">
-                                    <span className="text-slate-500">Slices Count:</span>
-                                    <span>{parsedOriginal.numSlices}</span>
-                                </div>
-                                <div className="flex justify-between">
-                                    <span className="text-slate-500">Default W / L:</span>
-                                    <span>{Math.round(parsedOriginal.defaultWindowWidth)} / {Math.round(parsedOriginal.defaultWindowCenter)}</span>
+                                <div className="flex-1 overflow-y-auto space-y-0.5 font-mono text-xs pr-1">
+                                    {patientHierarchy.tree && patientHierarchy.tree.children && patientHierarchy.tree.children.length > 0 ? (
+                                        patientHierarchy.tree.children.map((childNode) => (
+                                            <DirectoryTreeNode
+                                                key={childNode.id}
+                                                node={childNode}
+                                                depth={0}
+                                                activeStudyId={activeStudyId}
+                                                expandedNodes={expandedStudies}
+                                                onToggleExpand={toggleStudyExpand}
+                                                onOpenStudy={handleOpenStudy}
+                                                filterText={subfolderFilter}
+                                            />
+                                        ))
+                                    ) : (
+                                        <div className="text-white/30 text-center py-6 text-[11px]">No folders found</div>
+                                    )}
                                 </div>
                             </div>
-                        </div>
+                        )}
+
+                        {/* Tab 2: Clinical Profile */}
+                        {sidebarTab === 'clinical' && (
+                            <div className="flex-1 overflow-y-auto p-2">
+                                <ClinicalDataPanel clinicalData={clinicalData} />
+                            </div>
+                        )}
+
+                        {/* Tab 3: Metadata Tags */}
+                        {sidebarTab === 'metadata' && parsedOriginal && (
+                            <div className="flex-1 overflow-y-auto p-3 text-[11px] font-mono space-y-2">
+                                <div className="border border-white/10 rounded p-2 space-y-1 text-white/60">
+                                    <div className="text-white/30 text-[9px] uppercase tracking-wider mb-1">File</div>
+                                    <div className="text-white/80 truncate">{rawFile?.name || 'Scan'}</div>
+                                    <div className="text-white/35">{parsedOriginal.type.toUpperCase()}</div>
+                                </div>
+                                <div className="border border-white/10 rounded p-2 space-y-1.5 text-white/60">
+                                    <div className="text-white/30 text-[9px] uppercase tracking-wider mb-1">Info</div>
+                                    <div className="flex justify-between">
+                                        <span className="text-white/35">Dimensions</span>
+                                        <span>{parsedOriginal.cols} × {parsedOriginal.rows}</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-white/35">Slices</span>
+                                        <span>{parsedOriginal.numSlices}</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-white/35">W / L</span>
+                                        <span>{Math.round(parsedOriginal.defaultWindowWidth)} / {Math.round(parsedOriginal.defaultWindowCenter)}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
                     </aside>
+                ) : (
+                    /* Collapsed handle */
+                    <button
+                        onClick={() => setIsSidebarOpen(true)}
+                        className="w-6 bg-[#091422] hover:bg-white/5 border-r border-white/10 flex flex-col items-center justify-center py-4 text-white/25 hover:text-white/60 transition z-20 cursor-pointer shrink-0"
+                        title="Expand sidebar"
+                    >
+                        <ChevronRight className="w-3.5 h-3.5 mb-2" />
+                        <span className="text-[9px] font-mono [writing-mode:vertical-rl] rotate-180">
+                            {patientHierarchy ? `${patientHierarchy.studies.length} folders` : 'sidebar'}
+                        </span>
+                    </button>
                 )}
 
                 {/* VIEWPORTS CONTAINER */}
                 {!parsedOriginal ? (
-                    /* EMPTY DROPZONE STATE */
-                    <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-[#070b12] relative overflow-hidden">
-                        <div className="absolute w-[500px] h-[500px] bg-cyan-600/5 rounded-full blur-3xl pointer-events-none" />
-
-                        <div className="max-w-md bg-[#0e1622]/80 border border-slate-800 rounded-2xl p-8 backdrop-blur-xl shadow-2xl space-y-5 relative z-10">
-                            <div className="w-16 h-16 bg-gradient-to-br from-cyan-500/20 to-blue-600/20 border border-cyan-500/40 rounded-2xl flex items-center justify-center mx-auto shadow-inner">
-                                <Upload className="w-8 h-8 text-cyan-400" />
-                            </div>
-
-                            <div className="space-y-1">
-                                <h2 className="text-lg font-bold text-slate-100 tracking-wide">Cardiac MRI Workstation</h2>
-                                <p className="text-xs text-slate-400">
-                                    Upload single scans or an entire patient folder containing multiple views (CINE, Short-Axis, 2CH, 4CH, LGE).
+                    patientHierarchy ? (
+                        /* FOLDER LOADED BUT NO SCAN SELECTED YET */
+                        <div className="flex-1 flex flex-col items-center justify-center bg-[#091422] text-center p-8 select-none">
+                            <div className="max-w-sm space-y-3 p-6 rounded-lg border border-white/10 bg-[#0d1b2a]/70">
+                                <Folder className="w-8 h-8 text-white/30 mx-auto" />
+                                <div>
+                                    <p className="text-sm text-white/80 font-medium font-mono">{patientStudyName || 'Patient Study'}</p>
+                                    <p className="text-xs text-white/40 font-mono mt-1">
+                                        {patientHierarchy.studies.length} scans available
+                                    </p>
+                                </div>
+                                <p className="text-[11px] text-white/35 font-mono pt-1">
+                                    Select a scan from the folders list to view
                                 </p>
                             </div>
-
-                            <div className="flex items-center justify-center space-x-2 text-[10px] font-mono text-slate-400 pt-1">
-                                <span className="bg-slate-900 border border-slate-800 px-2 py-1 rounded">.DCM</span>
-                                <span className="bg-slate-900 border border-slate-800 px-2 py-1 rounded">.DICOM</span>
-                                <span className="bg-slate-900 border border-slate-800 px-2 py-1 rounded">.NII</span>
-                                <span className="bg-slate-900 border border-slate-800 px-2 py-1 rounded">.NII.GZ</span>
-                            </div>
-
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
-                                <button
-                                    onClick={() => fileInputRef.current?.click()}
-                                    className="bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white py-2.5 px-3 rounded-xl font-bold text-xs shadow-lg transition active:scale-95 ring-1 ring-cyan-400/30 flex items-center justify-center gap-2"
-                                >
-                                    <Upload className="w-4 h-4" />
-                                    <span>Select Scan(s)</span>
-                                </button>
-
-                                <button
-                                    onClick={() => folderInputRef.current?.click()}
-                                    className="bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white py-2.5 px-3 rounded-xl font-bold text-xs shadow-lg transition active:scale-95 ring-1 ring-amber-400/30 flex items-center justify-center gap-2"
-                                >
-                                    <FolderOpen className="w-4 h-4" />
-                                    <span>Patient Folder</span>
-                                </button>
+                        </div>
+                    ) : (
+                        /* INITIAL EMPTY STATE BEFORE UPLOAD */
+                        <div className="flex-1 flex flex-col items-center justify-center bg-[#091422] text-center p-8">
+                            <div className="max-w-xs space-y-4">
+                                <Upload className="w-8 h-8 text-white/20 mx-auto" />
+                                <div>
+                                    <p className="text-sm text-white/50 font-medium">Cardiac MRI Workstation</p>
+                                    <p className="text-xs text-white/25 mt-1">Upload a scan or patient folder to begin</p>
+                                </div>
+                                <div className="flex items-center justify-center gap-2 text-[10px] font-mono text-white/20">
+                                    <span>.DCM</span><span>·</span><span>.DICOM</span><span>·</span><span>.NII</span><span>·</span><span>.NII.GZ</span>
+                                </div>
+                                <div className="flex gap-2 justify-center pt-1">
+                                    <button
+                                        onClick={() => fileInputRef.current?.click()}
+                                        className="border border-white/15 hover:border-white/30 text-white/50 hover:text-white/80 px-4 py-2 rounded text-xs font-mono transition flex items-center gap-1.5"
+                                    >
+                                        <Upload className="w-3.5 h-3.5" />
+                                        <span>Select Scan(s)</span>
+                                    </button>
+                                    <button
+                                        onClick={() => folderInputRef.current?.click()}
+                                        className="border border-white/15 hover:border-white/30 text-white/50 hover:text-white/80 px-4 py-2 rounded text-xs font-mono transition flex items-center gap-1.5"
+                                    >
+                                        <FolderOpen className="w-3.5 h-3.5" />
+                                        <span>Patient Folder</span>
+                                    </button>
+                                </div>
                             </div>
                         </div>
-                    </div>
+                    )
                 ) : (
                     /* LOADED VIEWPORTS */
                     <div className="flex-1 flex overflow-hidden relative" ref={containerRef}>
@@ -1181,31 +1378,32 @@ export default function MedicalViewer() {
                             onMouseUp={handleMouseUp}
                             onWheel={handleWheel}
                         >
-                            {/* Viewport Overlay Header (Top Left) */}
-                            <div className="absolute top-3 left-3 z-10 flex items-center space-x-2 bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-800 text-xs shadow-md font-mono">
-                                <span className="font-bold text-cyan-300">ORIGINAL CARDIAC SCAN</span>
-                                <span className="text-slate-400 text-[10px] bg-slate-800 px-1.5 py-0.5 rounded">
-                                    {parsedOriginal.type.toUpperCase()}
-                                </span>
+                            {/* Viewport Overlay — Top Left */}
+                            <div className="absolute top-2 left-2 z-10 flex items-center gap-1.5 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/50">
+                                <span>{parsedOriginal.type.toUpperCase()}</span>
                                 {selectedMaskType === 'gt' && (
-                                    <span className="text-emerald-300 text-[10px] bg-emerald-950/80 border border-emerald-600/60 px-1.5 py-0.5 rounded flex items-center gap-1 font-semibold">
-                                        <ShieldCheck className="w-2.5 h-2.5" />
-                                        GT MASK ON
-                                    </span>
+                                    <span className="text-white/60 border border-white/15 px-1 rounded">GT</span>
+                                )}
+                                {activeStudyObj && (
+                                    <button
+                                        onClick={() => { setIsSidebarOpen(true); setSidebarTab('folders'); }}
+                                        className="text-white/50 hover:text-white/80 border border-white/10 hover:border-white/25 px-1.5 rounded transition cursor-pointer"
+                                        title="Open folders sidebar"
+                                    >
+                                        {currentSeriesObj?.viewType || currentSeriesObj?.filename || activeStudyObj.name}
+                                    </button>
                                 )}
                             </div>
 
-                            {/* Viewport Information Overlay (Top Right) */}
-                            <div className="absolute top-3 right-3 z-10 bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-800 text-[11px] font-mono text-slate-300 space-y-0.5 shadow-md">
-                                <div>Dim: {parsedOriginal.cols}×{parsedOriginal.rows}</div>
-                                <div>Slice: {currentSlice + 1} / {parsedOriginal.numSlices}</div>
-                                {((parsedOriginal.numTimeFrames || 1) > 1) && (
-                                    <div className="text-emerald-400 font-bold">
-                                        {parsedOriginal.isT1Mapping
-                                            ? `TI: ${currentFrameMeta?.inversionTime ? currentFrameMeta.inversionTime : `${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames}`}`
-                                            : parsedOriginal.isDense
-                                            ? `Phase: ${currentTimeFrame + 1} / ${parsedOriginal.numTimeFrames} ${isPlayingCine ? '• PLAY' : ''}`
-                                            : `Phase: ${currentTimeFrame + 1} / ${parsedOriginal.numTimeFrames} ${currentFrameMeta?.triggerTime ? `(${currentFrameMeta.triggerTime})` : ''} ${isPlayingCine ? '• CINE' : ''}`
+                            {/* Viewport Overlay — Top Right */}
+                            <div className="absolute top-2 right-2 z-10 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/40 space-y-0.5">
+                                <div>{parsedOriginal.cols}×{parsedOriginal.rows}</div>
+                                <div>{currentSlice + 1} / {parsedOriginal.numSlices}</div>
+                                {((parsedOriginal.numTimeFrames || 1) > 1 && (isCineImage || isT1Image)) && (
+                                    <div className="text-white/60">
+                                        {isT1Image
+                                            ? `TI: ${currentFrameMeta?.inversionTime ?? `${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames}`}`
+                                            : `Ph: ${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames}${isPlayingCine ? ' ▶' : ''}`
                                         }
                                     </div>
                                 )}
@@ -1224,12 +1422,12 @@ export default function MedicalViewer() {
                                 />
                             </div>
 
-                            {/* Viewport Information Overlay (Bottom Left) */}
-                            <div className="absolute bottom-3 left-3 z-10 bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-800 text-[11px] font-mono text-slate-300 flex items-center space-x-3 shadow-md">
+                            {/* Viewport Overlay — Bottom Left */}
+                            <div className="absolute bottom-2 left-2 z-10 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/40 flex items-center gap-3">
                                 <span>W: {Math.round(windowWidth)}</span>
                                 <span>L: {Math.round(windowCenter)}</span>
-                                <span className="text-cyan-400 font-bold">Zoom: {zoom.toFixed(2)}x</span>
-                                <span>X:{mousePos.x} Y:{mousePos.y}</span>
+                                <span>{zoom.toFixed(2)}x</span>
+                                <span>{mousePos.x},{mousePos.y}</span>
                             </div>
                         </div>
 
@@ -1242,18 +1440,17 @@ export default function MedicalViewer() {
                                 onMouseUp={handleMouseUp}
                                 onWheel={handleWheel}
                             >
-                                {/* Viewport Overlay Header */}
-                                <div className="absolute top-3 left-3 z-10 flex items-center space-x-2 bg-emerald-950/90 backdrop-blur-md px-3 py-1.5 rounded-lg border border-emerald-800/60 text-xs shadow-md font-mono">
-                                    <Zap className="w-3.5 h-3.5 text-amber-300 fill-amber-300 animate-pulse" />
-                                    <span className="font-bold text-emerald-300">LOCALIZED LV ROI</span>
-                                    <span className="text-emerald-400 font-mono text-[10px] bg-emerald-900/60 px-1.5 py-0.5 rounded border border-emerald-700/50">MODEL OUTPUT</span>
+                                {/* Viewport 2 — Top Left */}
+                                <div className="absolute top-2 left-2 z-10 flex items-center gap-1.5 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/50">
+                                    <span>LOCALIZED LV</span>
+                                    <span className="border border-white/10 px-1 rounded text-white/35">MODEL</span>
                                 </div>
 
-                                {/* Viewport Information Overlay (Top Right) */}
+                                {/* Viewport 2 — Top Right */}
                                 {parsedLocalized && (
-                                    <div className="absolute top-3 right-3 z-10 bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-800 text-[11px] font-mono text-emerald-300 space-y-0.5 shadow-md">
-                                        <div>Dim: {parsedLocalized.cols}×{parsedLocalized.rows}</div>
-                                        <div>ROI Extracted ✅</div>
+                                    <div className="absolute top-2 right-2 z-10 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/40 space-y-0.5">
+                                        <div>{parsedLocalized.cols}×{parsedLocalized.rows}</div>
+                                        <div>ROI extracted</div>
                                     </div>
                                 )}
 
@@ -1269,7 +1466,7 @@ export default function MedicalViewer() {
                                                 imageRendering: 'pixelated',
                                                 transition: isDraggingPan ? 'none' : 'transform 0.1s ease-out'
                                             }}
-                                            className="max-w-full max-h-full object-contain cursor-crosshair shadow-2xl ring-1 ring-emerald-500/30"
+                                            className="max-w-full max-h-full object-contain cursor-crosshair shadow-2xl"
                                         />
                                     ) : (
                                         <div className="flex flex-col items-center justify-center text-slate-500">
@@ -1279,10 +1476,9 @@ export default function MedicalViewer() {
                                     )}
                                 </div>
 
-                                {/* Viewport Information Overlay (Bottom Left) */}
-                                <div className="absolute bottom-3 left-3 z-10 bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-800 text-[11px] font-mono text-slate-300 flex items-center space-x-3 shadow-md">
-                                    <span className="text-emerald-400 font-bold">Synchronized View</span>
-                                    <span>LV ROI Active</span>
+                                {/* Viewport 2 — Bottom Left */}
+                                <div className="absolute bottom-2 left-2 z-10 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/35">
+                                    Synchronized · LV ROI
                                 </div>
                             </div>
                         )}
@@ -1290,122 +1486,119 @@ export default function MedicalViewer() {
                 )}
             </div>
 
-            {/* ── FOOTER SLICE / CINE NAVIGATOR BAR ────────────────────────────── */}
+            {/* ── FOOTER NAVIGATOR ── */}
             {parsedOriginal && (
-                <footer className="h-12 bg-[#0c131d] border-t border-slate-800/80 px-6 flex items-center justify-between z-20 text-xs shadow-inner">
-                    <div className="flex items-center space-x-4 w-full max-w-4xl mx-auto font-mono">
-                        {/* Cine Playback Button & FPS Control (available for Cine sequences) */}
-                        {isCineImage && (
-                            <div className="flex items-center space-x-1.5 bg-slate-900 px-2 py-1 rounded-lg border border-slate-800 flex-shrink-0">
-                                <button
-                                    onClick={() => setIsPlayingCine(!isPlayingCine)}
-                                    className={`p-1 rounded-md transition cursor-pointer ${
-                                        isPlayingCine
-                                            ? 'bg-amber-950 text-amber-300 border border-amber-600/80 ring-1 ring-amber-500/50'
-                                            : 'text-slate-300 hover:text-white'
-                                    }`}
-                                    title={isPlayingCine ? "Pause Cine Loop" : "Play Cine Loop"}
-                                >
-                                    {isPlayingCine ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
-                                </button>
-                                <select
-                                    value={cineFps}
-                                    onChange={(e) => setCineFps(Number(e.target.value))}
-                                    className="bg-transparent text-[10px] text-amber-400 font-mono font-bold focus:outline-none cursor-pointer"
-                                    title="CINE Playback Speed (Frames Per Second)"
-                                >
-                                    <option value={10}>10 fps</option>
-                                    <option value={15}>15 fps</option>
-                                    <option value={20}>20 fps</option>
-                                    <option value={25}>25 fps</option>
-                                    <option value={30}>30 fps</option>
-                                </select>
-                            </div>
-                        )}
+                <footer className="h-10 bg-[#091422] border-t border-white/10 px-4 flex items-center z-20 text-xs font-mono gap-3">
+                    {/* Cine play / fps */}
+                    {isCineImage && (
+                        <div className="flex items-center gap-1.5 flex-shrink-0">
+                            <button
+                                onClick={() => setIsPlayingCine(!isPlayingCine)}
+                                className={`p-1 rounded transition cursor-pointer ${
+                                    isPlayingCine
+                                        ? 'bg-white/10 text-white'
+                                        : 'text-white/40 hover:text-white/70'
+                                }`}
+                                title={isPlayingCine ? 'Pause' : 'Play'}
+                            >
+                                {isPlayingCine ? <Pause className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}
+                            </button>
+                            <select
+                                value={cineFps}
+                                onChange={(e) => setCineFps(Number(e.target.value))}
+                                className="bg-transparent text-[10px] text-white/40 focus:outline-none cursor-pointer"
+                            >
+                                <option value={10}>10 fps</option>
+                                <option value={15}>15 fps</option>
+                                <option value={20}>20 fps</option>
+                                <option value={25}>25 fps</option>
+                                <option value={30}>30 fps</option>
+                            </select>
+                        </div>
+                    )}
 
-                        {/* Spatial Slice Navigation (when volume has multiple spatial slices) */}
-                        {parsedOriginal.numSlices > 1 && (
-                            <div className="flex items-center space-x-2 flex-shrink-0">
-                                <button
-                                    onClick={() => setCurrentSlice((prev) => Math.max(0, prev - 1))}
-                                    disabled={currentSlice === 0}
-                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                                    title="Previous Spatial Slice"
-                                >
-                                    <ChevronLeft className="w-4 h-4" />
-                                </button>
-                                <span className="text-cyan-300 w-28 text-center font-bold">
-                                    Slice {currentSlice + 1} / {parsedOriginal.numSlices}
-                                </span>
-                                <button
-                                    onClick={() => setCurrentSlice((prev) => Math.min(parsedOriginal.numSlices - 1, prev + 1))}
-                                    disabled={currentSlice === parsedOriginal.numSlices - 1}
-                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                                    title="Next Spatial Slice"
-                                >
-                                    <ChevronRight className="w-4 h-4" />
-                                </button>
-
-                                {parsedOriginal.numTimeFrames <= 1 && (
+                    {/* Spatial slice nav & main slider */}
+                    {parsedOriginal.numSlices > 1 && (
+                        <div className={`flex items-center gap-1.5 ${!isCineImage && !isT1Image ? 'flex-1' : 'flex-shrink-0'}`}>
+                            <button
+                                onClick={() => setCurrentSlice((prev) => Math.max(0, prev - 1))}
+                                disabled={currentSlice === 0}
+                                className="p-1 rounded bg-white/5 text-white/50 hover:text-white disabled:opacity-25 transition"
+                            >
+                                <ChevronLeft className="w-3.5 h-3.5" />
+                            </button>
+                            <span className="text-white/50 w-24 text-center">
+                                {currentSlice + 1} / {parsedOriginal.numSlices}
+                            </span>
+                            <button
+                                onClick={() => setCurrentSlice((prev) => Math.min(parsedOriginal.numSlices - 1, prev + 1))}
+                                disabled={currentSlice === parsedOriginal.numSlices - 1}
+                                className="p-1 rounded bg-white/5 text-white/50 hover:text-white disabled:opacity-25 transition"
+                            >
+                                <ChevronRight className="w-3.5 h-3.5" />
+                            </button>
+                            {/* If not a CINE or T1 sequence (e.g. Localizer or 3D volume), this is the MAIN full-width slider! */}
+                            {(!isCineImage && !isT1Image) ? (
+                                <input
+                                    type="range"
+                                    min="0"
+                                    max={parsedOriginal.numSlices - 1}
+                                    value={currentSlice}
+                                    onChange={(e) => setCurrentSlice(Number(e.target.value))}
+                                    className="flex-1 accent-white h-1 bg-white/10 rounded cursor-pointer"
+                                />
+                            ) : (
+                                parsedOriginal.numTimeFrames <= 1 && (
                                     <input
                                         type="range"
                                         min="0"
                                         max={parsedOriginal.numSlices - 1}
                                         value={currentSlice}
                                         onChange={(e) => setCurrentSlice(Number(e.target.value))}
-                                        className="w-36 accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
-                                        title="Navigate Spatial Slices"
+                                        className="w-32 accent-white h-1 bg-white/10 rounded cursor-pointer"
                                     />
-                                )}
-                            </div>
-                        )}
+                                )
+                            )}
+                        </div>
+                    )}
 
-                        {parsedOriginal.numSlices > 1 && (parsedOriginal.numTimeFrames || 1) > 1 && (
-                            <div className="h-4 w-px bg-slate-700 mx-1 flex-shrink-0" />
-                        )}
+                    {parsedOriginal.numSlices > 1 && (isCineImage || isT1Image) && (parsedOriginal.numTimeFrames || 1) > 1 && (
+                        <div className="h-3 w-px bg-white/10 flex-shrink-0" />
+                    )}
 
-                        {/* Temporal Frames / Cardiac Phases / Inversion Times (TI) Scrubber Slider */}
-                        {(parsedOriginal.numTimeFrames || 1) > 1 && (
-                            <div className="flex items-center space-x-2 flex-1">
-                                <button
-                                    onClick={() => setCurrentTimeFrame((prev) => Math.max(0, prev - 1))}
-                                    disabled={currentTimeFrame === 0}
-                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                                    title="Previous Timepoint / TI"
-                                >
-                                    <ChevronLeft className="w-4 h-4" />
-                                </button>
-
-                                <span className="text-amber-300 font-bold whitespace-nowrap min-w-[140px] text-center">
-                                    {parsedOriginal.isT1Mapping
-                                        ? `TI ${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames} ${currentFrameMeta?.inversionTime ? `(${currentFrameMeta.inversionTime})` : ''}`
-                                        : parsedOriginal.isDense
-                                        ? `Phase ${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames}`
-                                        : `Phase ${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames} ${currentFrameMeta?.triggerTime ? `(${currentFrameMeta.triggerTime})` : ''}`
-                                    }
-                                </span>
-
-                                <button
-                                    onClick={() => setCurrentTimeFrame((prev) => Math.min(parsedOriginal.numTimeFrames - 1, prev + 1))}
-                                    disabled={currentTimeFrame === parsedOriginal.numTimeFrames - 1}
-                                    className="p-1.5 rounded-lg bg-slate-900 text-slate-300 border border-slate-800 hover:text-white disabled:opacity-40"
-                                    title="Next Timepoint / TI"
-                                >
-                                    <ChevronRight className="w-4 h-4" />
-                                </button>
-
-                                <input
-                                    type="range"
-                                    min="0"
-                                    max={parsedOriginal.numTimeFrames - 1}
-                                    value={currentTimeFrame}
-                                    onChange={(e) => setCurrentTimeFrame(Number(e.target.value))}
-                                    className="flex-1 accent-amber-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
-                                    title={parsedOriginal.isT1Mapping ? "Scrub Inversion Times (TI)" : "Scrub Cardiac Phases"}
-                                />
-                            </div>
-                        )}
-                    </div>
+                    {/* Temporal / phase / TI scrubber (ONLY for true CINE or T1 Mapping sequences) */}
+                    {(isCineImage || isT1Image) && (parsedOriginal.numTimeFrames || 1) > 1 && (
+                        <div className="flex items-center gap-1.5 flex-1">
+                            <button
+                                onClick={() => setCurrentTimeFrame((prev) => Math.max(0, prev - 1))}
+                                disabled={currentTimeFrame === 0}
+                                className="p-1 rounded bg-white/5 text-white/50 hover:text-white disabled:opacity-25 transition"
+                            >
+                                <ChevronLeft className="w-3.5 h-3.5" />
+                            </button>
+                            <span className="text-white/50 whitespace-nowrap min-w-[120px] text-center">
+                                {isT1Image
+                                    ? `TI ${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames}${currentFrameMeta?.inversionTime ? ` (${currentFrameMeta.inversionTime})` : ''}`
+                                    : `Phase ${currentTimeFrame + 1}/${parsedOriginal.numTimeFrames}${currentFrameMeta?.triggerTime ? ` (${currentFrameMeta.triggerTime})` : ''}`
+                                }
+                            </span>
+                            <button
+                                onClick={() => setCurrentTimeFrame((prev) => Math.min(parsedOriginal.numTimeFrames - 1, prev + 1))}
+                                disabled={currentTimeFrame === parsedOriginal.numTimeFrames - 1}
+                                className="p-1 rounded bg-white/5 text-white/50 hover:text-white disabled:opacity-25 transition"
+                            >
+                                <ChevronRight className="w-3.5 h-3.5" />
+                            </button>
+                            <input
+                                type="range"
+                                min="0"
+                                max={parsedOriginal.numTimeFrames - 1}
+                                value={currentTimeFrame}
+                                onChange={(e) => setCurrentTimeFrame(Number(e.target.value))}
+                                className="flex-1 accent-white h-1 bg-white/10 rounded cursor-pointer"
+                            />
+                        </div>
+                    )}
                 </footer>
             )}
 
@@ -1415,20 +1608,49 @@ export default function MedicalViewer() {
                     seriesList={seriesList}
                     activeSeriesId={activeSeriesId}
                     onSelectSeries={selectSeries}
+                    parsedOriginal={parsedOriginal}
+                    currentSlice={currentSlice}
+                    currentTimeFrame={currentTimeFrame}
+                    onSelectSlice={(sIdx, tIdx) => {
+                        setCurrentSlice(sIdx);
+                        if (typeof tIdx === 'number') setCurrentTimeFrame(tIdx);
+                    }}
+                    activeSubfolderName={currentSeriesObj?.viewType || currentSeriesObj?.filename || activeStudyObj?.name || ''}
                     onOpenFolderUpload={() => folderInputRef.current?.click()}
                     onOpenFileUpload={() => fileInputRef.current?.click()}
+                    onOpenStudiesDb={patientHierarchy?.studies?.length > 0 ? () => setShowStudiesDbModal(true) : null}
+                    studiesCount={patientHierarchy?.studies?.length || 0}
                     onClose={() => setShowSeriesBrowser(false)}
                     patientName={patientStudyName}
                 />
             )}
 
+            {/* ── FULL DOCUMENTS DB MODAL (Horos / OsiriX Style) ─────────────── */}
+            {showStudiesDbModal && patientHierarchy && (
+                <div className="fixed inset-0 z-50 bg-[#091422]/80 backdrop-blur-md flex items-center justify-center p-6 animate-fade-in">
+                    <div className="bg-[#080d16] border border-cyan-500/50 rounded-2xl max-w-5xl w-full max-h-[85vh] shadow-2xl flex flex-col overflow-hidden">
+                        <StudyHierarchyBrowser
+                            hierarchy={patientHierarchy}
+                            activeStudyId={activeStudyId}
+                            onSelectStudy={(study) => {
+                                handleOpenStudy(study);
+                                setShowStudiesDbModal(false);
+                            }}
+                            isLoadingStudy={isLoadingStudy}
+                            onClose={() => setShowStudiesDbModal(false)}
+                            isCollapsed={false}
+                        />
+                    </div>
+                </div>
+            )}
+
             {/* ── KEYBOARD SHORTCUTS HELP MODAL ─────────────────────────────────── */}
             {showShortcutsModal && (
-                <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+                <div className="fixed inset-0 z-50 bg-[#091422]/70 backdrop-blur-sm flex items-center justify-center p-4">
                     <div className="bg-[#0e1622] border border-cyan-500/40 rounded-2xl max-w-md w-full p-6 shadow-2xl relative space-y-4">
                         <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-                            <div className="flex items-center space-x-2 text-cyan-400 font-bold">
-                                <Sparkles className="w-4 h-4 text-cyan-400" />
+                            <div className="flex items-center space-x-2 text-white/40 font-bold">
+                                <Sparkles className="w-4 h-4 text-white/40" />
                                 <span>Workstation Navigation & Shortcuts</span>
                             </div>
                             <button onClick={() => setShowShortcutsModal(false)} className="text-slate-400 hover:text-white">
@@ -1439,19 +1661,19 @@ export default function MedicalViewer() {
                         <div className="space-y-2.5 text-xs font-mono text-slate-300">
                             <div className="flex justify-between bg-slate-900/80 px-3 py-2 rounded-lg border border-slate-800">
                                 <span>Pan Image:</span>
-                                <span className="text-cyan-300">Select Pan Tool & Drag</span>
+                                <span className="text-white/60">Select Pan Tool & Drag</span>
                             </div>
                             <div className="flex justify-between bg-slate-900/80 px-3 py-2 rounded-lg border border-slate-800">
                                 <span>Zoom In / Out:</span>
-                                <span className="text-cyan-300">Ctrl + Wheel or Zoom Tool</span>
+                                <span className="text-white/60">Ctrl + Wheel or Zoom Tool</span>
                             </div>
                             <div className="flex justify-between bg-slate-900/80 px-3 py-2 rounded-lg border border-slate-800">
                                 <span>Brightness / Contrast:</span>
-                                <span className="text-cyan-300">Window Tool & Drag</span>
+                                <span className="text-white/60">Window Tool & Drag</span>
                             </div>
                             <div className="flex justify-between bg-slate-900/80 px-3 py-2 rounded-lg border border-slate-800">
                                 <span>Next / Prev Slice:</span>
-                                <span className="text-cyan-300">Mouse Scroll Wheel</span>
+                                <span className="text-white/60">Mouse Scroll Wheel</span>
                             </div>
                         </div>
 
