@@ -96,6 +96,15 @@ export async function parseMedicalFile(arrayBuffer, filename) {
             ? `${cols} × ${rows} × ${numSlices} × ${numTimeFrames} (4D CINE)`
             : `${cols} × ${rows} × ${numSlices} (3D Volume)`;
 
+        const getSliceInfo = () => ({
+            cols,
+            rows,
+            min,
+            max,
+            wc: min + (max - min) / 2,
+            ww: max - min || 1,
+        });
+
         return {
             type: 'nifti',
             filename,
@@ -109,6 +118,7 @@ export async function parseMedicalFile(arrayBuffer, filename) {
             defaultWindowCenter: min + (max - min) / 2,
             defaultWindowWidth: max - min || 1,
             getSliceData,
+            getSliceInfo,
             metadata: {
                 FileType: 'NIfTI (.nii/.nii.gz)',
                 Filename: filename,
@@ -364,13 +374,33 @@ export function assembleDicomSeries(items, seriesName) {
 
         if (group.items.length === 1 && group.items[0].numFrames > 1) {
             const item = group.items[0];
+            const itemFrameSize = item.cols * item.rows;
             const t = Math.max(0, Math.min(timeFrameIndex, item.numFrames - 1));
-            return item.pixelData.subarray(t * frameSize, (t + 1) * frameSize);
+            return item.pixelData.subarray(t * itemFrameSize, (t + 1) * itemFrameSize);
         }
 
         const t = Math.max(0, Math.min(timeFrameIndex, group.items.length - 1));
         const item = group.items[t];
         return item.pixelData;
+    };
+
+    // getSliceInfo(sliceIndex, timeFrameIndex) — returns per-slice dimensions and intensity range
+    const getSliceInfo = (sliceIndex = 0, timeFrameIndex = 0) => {
+        const z = Math.max(0, Math.min(sliceIndex, numSlices - 1));
+        const group = spatialGroups[z];
+        if (!group || group.items.length === 0) {
+            return { cols, rows, min, max, wc: first.wc, ww: first.ww };
+        }
+        const t = Math.max(0, Math.min(timeFrameIndex, group.items.length - 1));
+        const item = group.items[t];
+        return {
+            cols: item.cols || cols,
+            rows: item.rows || rows,
+            min: item.min ?? min,
+            max: item.max ?? max,
+            wc: item.wc ?? first.wc,
+            ww: item.ww ?? first.ww,
+        };
     };
 
     // getTimeFrameMeta(sliceIndex, timeFrameIndex)
@@ -413,6 +443,7 @@ export function assembleDicomSeries(items, seriesName) {
         defaultWindowCenter: first.wc,
         defaultWindowWidth: first.ww,
         getSliceData,
+        getSliceInfo,
         getTimeFrameMeta,
         items,
         metadata: {
@@ -1096,17 +1127,18 @@ export function generateThumbnailUrl(parsed, targetSize = 128) {
         const midTime = Math.floor((parsed.numTimeFrames || 1) / 2);
         const sliceData = parsed.getSliceData(midSlice, midTime);
         if (!sliceData || sliceData.length === 0) return null;
+        const info = parsed.getSliceInfo ? parsed.getSliceInfo(midSlice, midTime) : null;
 
         const offCanvas = document.createElement('canvas');
         renderSliceToCanvas(
             offCanvas,
             sliceData,
-            parsed.cols,
-            parsed.rows,
-            parsed.defaultWindowCenter,
-            parsed.defaultWindowWidth,
-            parsed.min,
-            parsed.max
+            info?.cols || parsed.cols,
+            info?.rows || parsed.rows,
+            info?.wc ?? parsed.defaultWindowCenter,
+            info?.ww ?? parsed.defaultWindowWidth,
+            info?.min ?? parsed.min,
+            info?.max ?? parsed.max
         );
 
         const thumbCanvas = document.createElement('canvas');

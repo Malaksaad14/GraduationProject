@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import ALLOWED_ORIGINS
-from routers import upload, localizer, segment, convert, chatbot
+from routers import upload, localizer, segment, convert, chatbot, mask
 
 app = FastAPI(
     title="Myocardial Viability Assessment API",
@@ -26,6 +26,7 @@ app.include_router(localizer.router)
 app.include_router(segment.router)
 app.include_router(convert.router)
 app.include_router(chatbot.router)
+app.include_router(mask.router)
 
 
 

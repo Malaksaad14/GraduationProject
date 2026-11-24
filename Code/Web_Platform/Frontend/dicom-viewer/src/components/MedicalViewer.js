@@ -180,6 +180,14 @@ export default function MedicalViewer() {
     const [selectedMaskType, setSelectedMaskType] = useState('none'); // 'none' | 'gt' | 'ai'
     const [maskOpacity, setMaskOpacity] = useState(0.5);
 
+    // ── Brush / Mask Editor State ──────────────────────────────────────────────
+    const [isBrushMode, setIsBrushMode] = useState(false);       // brush tool active?
+    const [brushTool, setBrushTool] = useState('draw');           // 'draw' | 'erase'
+    const [brushLabel, setBrushLabel] = useState(1);              // 1: LV Myo, 2: LV Cavity, 3: RV
+    const [brushSize, setBrushSize] = useState(10);               // radius in image pixels
+    const [brushMaskData, setBrushMaskData] = useState(null);     // Map: sliceIdx → Uint8Array(rows*cols)
+    const [isBrushDrawing, setIsBrushDrawing] = useState(false);
+
     // ── Multi-Scan / Patient Folder Series State ──────────────────────────────
     const [seriesList, setSeriesList] = useState([]);
     const [activeSeriesId, setActiveSeriesId] = useState(null);
@@ -242,6 +250,7 @@ export default function MedicalViewer() {
     // ── Refs ───────────────────────────────────────────────────────────────────
     const origCanvasRef = useRef(null);
     const locCanvasRef = useRef(null);
+    const maskCanvasRef = useRef(null);
     const fileInputRef = useRef(null);
     const folderInputRef = useRef(null);
     const downloadMenuRef = useRef(null);
@@ -263,7 +272,15 @@ export default function MedicalViewer() {
             }
         };
         document.addEventListener('mousedown', handleClickOutside);
-        return () => document.removeEventListener('mousedown', handleClickOutside);
+        const handleGlobalMouseUp = () => {
+            setIsDraggingPan(false);
+            setIsBrushDrawing(false);
+        };
+        window.addEventListener('mouseup', handleGlobalMouseUp);
+        return () => {
+            document.removeEventListener('mousedown', handleClickOutside);
+            window.removeEventListener('mouseup', handleGlobalMouseUp);
+        };
     }, []);
 
     // ── Backend Health Check ───────────────────────────────────────────────────
@@ -323,6 +340,11 @@ export default function MedicalViewer() {
     const currentFrameMeta = parsedOriginal?.getTimeFrameMeta
         ? parsedOriginal.getTimeFrameMeta(currentSlice, currentTimeFrame)
         : null;
+    const currentSliceInfo = parsedOriginal?.getSliceInfo
+        ? parsedOriginal.getSliceInfo(currentSlice, currentTimeFrame)
+        : null;
+    const activeSliceCols = currentSliceInfo?.cols || parsedOriginal?.cols || 256;
+    const activeSliceRows = currentSliceInfo?.rows || parsedOriginal?.rows || 256;
 
     // ── Cine Loop Animation (Runs only for Cine sequences) ─────────────────────
     useEffect(() => {
@@ -429,6 +451,8 @@ export default function MedicalViewer() {
         setZoom(fit);
         setPan({ x: 0, y: 0 });
         setIsPlayingCine(false);
+        setIsBrushMode(false);
+        setBrushMaskData(null);
 
         // Restore cached localized view if available
         if (series.localizedResult) {
@@ -617,16 +641,19 @@ export default function MedicalViewer() {
 
         // Render Original Canvas (using spatial slice, cardiac time-frame, and optional mask overlay)
         const origSliceData = parsedOriginal.getSliceData(currentSlice, currentTimeFrame);
+        const sliceInfo = parsedOriginal.getSliceInfo
+            ? parsedOriginal.getSliceInfo(currentSlice, currentTimeFrame)
+            : null;
         if (origCanvasRef.current && origSliceData) {
             renderSliceToCanvas(
                 origCanvasRef.current,
                 origSliceData,
-                parsedOriginal.cols,
-                parsedOriginal.rows,
+                sliceInfo?.cols || parsedOriginal.cols,
+                sliceInfo?.rows || parsedOriginal.rows,
                 windowCenter,
                 windowWidth,
-                parsedOriginal.min,
-                parsedOriginal.max,
+                sliceInfo?.min ?? parsedOriginal.min,
+                sliceInfo?.max ?? parsedOriginal.max,
                 currentMaskData,
                 maskOpacity,
                 maskPalette
@@ -782,6 +809,11 @@ export default function MedicalViewer() {
     // ── Pan / Zoom / Window Level Mouse Handlers ──────────────────────────────
     const handleMouseDown = (e) => {
         if (!parsedOriginal) return;
+        if (isBrushMode) {
+            setIsBrushDrawing(true);
+            paintBrush(e.clientX, e.clientY);
+            return;
+        }
         setIsDraggingPan(true);
         setDragStart({ x: e.clientX, y: e.clientY });
     };
@@ -792,9 +824,14 @@ export default function MedicalViewer() {
         // Update Mouse Position info
         const rect = origCanvasRef.current?.getBoundingClientRect();
         if (rect) {
-            const mouseX = Math.round(((e.clientX - rect.left) / rect.width) * parsedOriginal.cols);
-            const mouseY = Math.round(((e.clientY - rect.top) / rect.height) * parsedOriginal.rows);
+            const mouseX = Math.round(((e.clientX - rect.left) / rect.width) * activeSliceCols);
+            const mouseY = Math.round(((e.clientY - rect.top) / rect.height) * activeSliceRows);
             setMousePos({ x: mouseX, y: mouseY, value: 'Active' });
+        }
+
+        if (isBrushMode) {
+            if (isBrushDrawing) paintBrush(e.clientX, e.clientY);
+            return;
         }
 
         if (!isDraggingPan) return;
@@ -814,7 +851,166 @@ export default function MedicalViewer() {
         }
     };
 
-    const handleMouseUp = () => setIsDraggingPan(false);
+    const handleMouseUp = () => {
+        setIsDraggingPan(false);
+        setIsBrushDrawing(false);
+    };
+
+    // ── Brush: render mask canvas overlay ─────────────────────────────────────
+    useEffect(() => {
+        const canvas = maskCanvasRef.current;
+        const imgCanvas = origCanvasRef.current;
+        if (!canvas || !imgCanvas || !parsedOriginal) return;
+
+        canvas.width = activeSliceCols;
+        canvas.height = activeSliceRows;
+
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (!isBrushMode) return;
+
+        const sliceMask = brushMaskData?.get(currentSlice);
+        if (!sliceMask) return;
+
+        const imgData = ctx.createImageData(activeSliceCols, activeSliceRows);
+        const alpha = Math.round(maskOpacity * 255);
+        for (let i = 0; i < sliceMask.length; i++) {
+            const label = sliceMask[i];
+            if (label > 0) {
+                let rgb = [16, 185, 129]; // Label 1: Emerald (LV Myo)
+                if (label === 2) rgb = [239, 68, 68];       // Label 2: Red (LV Cavity)
+                else if (label === 3) rgb = [245, 158, 11]; // Label 3: Amber (RV / Scar)
+                imgData.data[i * 4]     = rgb[0];
+                imgData.data[i * 4 + 1] = rgb[1];
+                imgData.data[i * 4 + 2] = rgb[2];
+                imgData.data[i * 4 + 3] = alpha;
+            }
+        }
+        ctx.putImageData(imgData, 0, 0);
+    }, [brushMaskData, currentSlice, parsedOriginal, isBrushMode, maskOpacity, activeSliceCols, activeSliceRows]);
+
+    // ── Brush: initialize mask (prefill from active GT/AI mask if available) ──
+    const handleStartBrushMode = useCallback(() => {
+        if (!parsedOriginal) return;
+        setIsBrushMode(true);
+        setBrushMaskData((prev) => {
+            const map = prev ? new Map(prev) : new Map();
+
+            for (let s = 0; s < parsedOriginal.numSlices; s++) {
+                if (!map.has(s)) {
+                    const sInfo = parsedOriginal.getSliceInfo ? parsedOriginal.getSliceInfo(s, 0) : null;
+                    const cols = sInfo?.cols || parsedOriginal.cols;
+                    const rows = sInfo?.rows || parsedOriginal.rows;
+                    const sliceArr = new Uint8Array(rows * cols);
+                    // If GT mask is currently active, preserve its integer labels (1, 2, 3...)
+                    if (selectedMaskType === 'gt' && activeGtMask?.parsed) {
+                        const mSlice = Math.min(s, (activeGtMask.parsed.numSlices || 1) - 1);
+                        const existingMask = activeGtMask.parsed.getSliceData(mSlice, 0);
+                        if (existingMask) {
+                            for (let i = 0; i < Math.min(sliceArr.length, existingMask.length); i++) {
+                                sliceArr[i] = existingMask[i] > 0 ? Math.min(255, Math.round(existingMask[i])) : 0;
+                            }
+                        }
+                    }
+                    map.set(s, sliceArr);
+                }
+            }
+            return map;
+        });
+    }, [parsedOriginal, selectedMaskType, activeGtMask]);
+
+    // ── Brush: convert display coords → image pixel coords ───────────────────
+    const displayToImageCoords = useCallback((clientX, clientY) => {
+        const imgCanvas = origCanvasRef.current;
+        if (!imgCanvas || !parsedOriginal) return null;
+        const rect = imgCanvas.getBoundingClientRect();
+        // getBoundingClientRect gives the displayed (scaled) canvas position
+        const px = Math.round(((clientX - rect.left) / rect.width) * activeSliceCols);
+        const py = Math.round(((clientY - rect.top) / rect.height) * activeSliceRows);
+        return { px, py };
+    }, [parsedOriginal, activeSliceCols, activeSliceRows]);
+
+    // ── Brush: paint circle in mask at image coords ───────────────────────────
+    const paintBrush = useCallback((clientX, clientY) => {
+        if (!parsedOriginal || !brushMaskData) return;
+        const coords = displayToImageCoords(clientX, clientY);
+        if (!coords) return;
+        const { px, py } = coords;
+        const cols = activeSliceCols;
+        const rows = activeSliceRows;
+        const r = brushSize;
+        const value = brushTool === 'draw' ? brushLabel : 0;
+
+        setBrushMaskData((prev) => {
+            const map = new Map(prev);
+            const slice = map.get(currentSlice) || new Uint8Array(rows * cols);
+            const updated = new Uint8Array(slice);
+            for (let dy = -r; dy <= r; dy++) {
+                for (let dx = -r; dx <= r; dx++) {
+                    if (dx * dx + dy * dy <= r * r) {
+                        const nx = px + dx;
+                        const ny = py + dy;
+                        if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) {
+                            updated[ny * cols + nx] = value;
+                        }
+                    }
+                }
+            }
+            map.set(currentSlice, updated);
+            return map;
+        });
+    }, [parsedOriginal, brushMaskData, brushSize, brushTool, brushLabel, currentSlice, displayToImageCoords, activeSliceCols, activeSliceRows]);
+
+    // ── Brush: save mask as NIfTI to backend (and optionally download) ────────
+    const handleSaveMask = useCallback(async (triggerDownload = false) => {
+        if (!parsedOriginal || !brushMaskData) return;
+        const numSlices = parsedOriginal.numSlices;
+        const rows = parsedOriginal.rows;
+        const cols = parsedOriginal.cols;
+
+        // Flatten all slices into one Uint8Array [slices × rows × cols]
+        const flatMask = new Uint8Array(numSlices * rows * cols);
+        for (let s = 0; s < numSlices; s++) {
+            const sliceArr = brushMaskData.get(s);
+            if (sliceArr) {
+                flatMask.set(sliceArr, s * rows * cols);
+            }
+        }
+
+        try {
+            const blob = new Blob([flatMask], { type: 'application/octet-stream' });
+            const form = new FormData();
+            form.append('mask_data', blob, 'brush_mask.bin');
+            form.append('num_slices', String(numSlices));
+            form.append('rows', String(rows));
+            form.append('cols', String(cols));
+            form.append('series_name', currentSeriesObj?.filename || parsedOriginal.filename || 'scan');
+            if (rawFile && /\.(nii|nii\.gz)$/i.test(rawFile.name)) {
+                form.append('reference_nifti', rawFile, rawFile.name);
+            }
+
+            const res = await fetch('http://localhost:8000/mask/save', { method: 'POST', body: form });
+            if (!res.ok) throw new Error(await res.text());
+            const data = await res.json();
+
+            const countsSummary = data.label_counts
+                ? Object.entries(data.label_counts).map(([k, v]) => `L${k}: ${v}`).join(', ')
+                : `${data.nonzero_voxels || 0} voxels`;
+            setStatusMessage(`Mask saved: ${data.filename} (${countsSummary || 'empty'})`);
+
+            if (triggerDownload && data.download_url) {
+                const link = document.createElement('a');
+                link.href = `http://localhost:8000${data.download_url}`;
+                link.download = data.filename;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+        } catch (err) {
+            setErrorMessage(`Mask save failed: ${err.message}`);
+        }
+    }, [parsedOriginal, brushMaskData, currentSeriesObj, rawFile]);
 
     const handleWheel = (e) => {
         if (!parsedOriginal) return;
@@ -888,7 +1084,7 @@ export default function MedicalViewer() {
             </header>
 
             {/* ── CONTROL TOOLBAR ── */}
-            <div className="h-11 bg-[#0d1b2a] border-b border-white/10 px-3 flex items-center justify-between text-xs z-40 gap-2 select-none">
+            <div className="h-11 bg-[#0d1b2a] border-b border-white/10 px-3 flex items-center justify-between text-xs z-40 gap-2 select-none overflow-x-auto">
                 {/* Left group */}
                 <div className="flex items-center gap-1.5 flex-shrink-0">
                     {/* Hidden file inputs */}
@@ -1108,6 +1304,126 @@ export default function MedicalViewer() {
                                         />
                                         <span className="text-[10px] text-white/30 font-mono w-6">{Math.round(maskOpacity * 100)}%</span>
                                     </div>
+                                )}
+                            </div>
+                        </>
+                    )}
+
+                    {/* ── Brush / Mask Editor Controls ── */}
+                    {parsedOriginal && (
+                        <>
+                            <div className="h-5 w-px bg-white/8 mx-0.5 flex-shrink-0" />
+                            <div className="flex items-center bg-white/5 rounded border border-white/8 px-1 gap-1 flex-shrink-0">
+                                {/* Toggle brush mode */}
+                                <button
+                                    onClick={() => {
+                                        if (isBrushMode) {
+                                            setIsBrushMode(false);
+                                        } else {
+                                            handleStartBrushMode();
+                                        }
+                                    }}
+                                    className={`flex items-center gap-1 px-2 py-1 rounded font-mono text-xs transition cursor-pointer ${
+                                        isBrushMode ? 'bg-white/15 text-white/90' : 'text-white/35 hover:text-white/60'
+                                    }`}
+                                    title="Toggle brush mask editor"
+                                >
+                                    <span className="font-mono text-[11px]">✎</span>
+                                    <span>Brush</span>
+                                </button>
+
+                                {isBrushMode && (
+                                    <>
+                                        {/* Region / Label selector (1, 2, 3) */}
+                                        <div className="flex items-center border-l border-white/8 pl-1 gap-0.5">
+                                            {[
+                                                { id: 1, name: 'L1', title: 'Region 1 (LV Myo)', dot: 'bg-emerald-500' },
+                                                { id: 2, name: 'L2', title: 'Region 2 (LV Cavity)', dot: 'bg-red-500' },
+                                                { id: 3, name: 'L3', title: 'Region 3 (RV / Scar)', dot: 'bg-amber-500' },
+                                            ].map((lbl) => (
+                                                <button
+                                                    key={lbl.id}
+                                                    onClick={() => { setBrushLabel(lbl.id); setBrushTool('draw'); }}
+                                                    title={lbl.title}
+                                                    className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono transition cursor-pointer ${
+                                                        brushTool === 'draw' && brushLabel === lbl.id
+                                                            ? 'bg-white/15 text-white'
+                                                            : 'text-white/40 hover:text-white/75'
+                                                    }`}
+                                                >
+                                                    <span className={`w-2 h-2 rounded-full ${lbl.dot}`} />
+                                                    <span>{lbl.name}</span>
+                                                </button>
+                                            ))}
+                                        </div>
+
+                                        {/* Draw / Erase toggle */}
+                                        <div className="flex items-center border-l border-white/8 pl-1 gap-0.5">
+                                            <button
+                                                onClick={() => setBrushTool('draw')}
+                                                className={`px-2 py-0.5 rounded text-[10px] font-mono transition cursor-pointer ${
+                                                    brushTool === 'draw' ? 'bg-white/15 text-white/90' : 'text-white/35 hover:text-white/60'
+                                                }`}
+                                            >Draw</button>
+                                            <button
+                                                onClick={() => setBrushTool('erase')}
+                                                className={`px-2 py-0.5 rounded text-[10px] font-mono transition cursor-pointer ${
+                                                    brushTool === 'erase' ? 'bg-white/15 text-white/90' : 'text-white/35 hover:text-white/60'
+                                                }`}
+                                            >Erase</button>
+                                        </div>
+
+                                        {/* Brush size */}
+                                        <div className="flex items-center gap-1 border-l border-white/8 pl-1">
+                                            <span className="text-[10px] text-white/30 font-mono">Size</span>
+                                            <input
+                                                type="range" min="2" max="40" step="1"
+                                                value={brushSize}
+                                                onChange={(e) => setBrushSize(Number(e.target.value))}
+                                                className="w-14 accent-white h-1 bg-white/10 rounded cursor-pointer"
+                                            />
+                                            <span className="text-[10px] text-white/30 font-mono w-5">{brushSize}</span>
+                                        </div>
+
+                                        {/* Opacity */}
+                                        <div className="flex items-center gap-1 border-l border-white/8 pl-1">
+                                            <span className="text-[10px] text-white/30 font-mono">Opacity</span>
+                                            <input
+                                                type="range" min="0.1" max="1" step="0.05"
+                                                value={maskOpacity}
+                                                onChange={(e) => setMaskOpacity(Number(e.target.value))}
+                                                className="w-12 accent-white h-1 bg-white/10 rounded cursor-pointer"
+                                            />
+                                        </div>
+
+                                        {/* Clear slice */}
+                                        <button
+                                            onClick={() => {
+                                                if (!parsedOriginal) return;
+                                                setBrushMaskData((prev) => {
+                                                    const map = new Map(prev);
+                                                    map.set(currentSlice, new Uint8Array(parsedOriginal.rows * parsedOriginal.cols));
+                                                    return map;
+                                                });
+                                            }}
+                                            className="border-l border-white/8 pl-1 px-2 py-0.5 text-[10px] font-mono text-white/30 hover:text-white/60 transition cursor-pointer"
+                                            title="Clear this slice"
+                                        >Clear</button>
+
+                                        {/* Save mask */}
+                                        <button
+                                            onClick={() => handleSaveMask(false)}
+                                            className="border-l border-white/8 pl-1 px-2 py-0.5 text-[10px] font-mono text-white/50 hover:text-white/80 transition cursor-pointer"
+                                            title="Save mask to backend (outputs/masks)"
+                                        >Save</button>
+
+                                        {/* Save & Download .nii.gz */}
+                                        <button
+                                            onClick={() => handleSaveMask(true)}
+                                            className="border-l border-white/8 pl-1 px-2 py-0.5 text-[10px] font-mono text-white/60 hover:text-white transition cursor-pointer"
+                                            title="Save and download _gt.nii.gz to re-upload with dataset"
+                                        >Download</button>
+                                    </>
                                 )}
                             </div>
                         </>
@@ -1397,7 +1713,7 @@ export default function MedicalViewer() {
 
                             {/* Viewport Overlay — Top Right */}
                             <div className="absolute top-2 right-2 z-10 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/40 space-y-0.5">
-                                <div>{parsedOriginal.cols}×{parsedOriginal.rows}</div>
+                                <div>{activeSliceCols}×{activeSliceRows}</div>
                                 <div>{currentSlice + 1} / {parsedOriginal.numSlices}</div>
                                 {((parsedOriginal.numTimeFrames || 1) > 1 && (isCineImage || isT1Image)) && (
                                     <div className="text-white/60">
@@ -1411,15 +1727,38 @@ export default function MedicalViewer() {
 
                             {/* Canvas Wrapper */}
                             <div className="flex-1 flex items-center justify-center overflow-hidden bg-black relative">
-                                <canvas
-                                    ref={origCanvasRef}
+                                <div
                                     style={{
+                                        position: 'relative',
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
                                         transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-                                        imageRendering: 'pixelated',
+                                        transformOrigin: 'center center',
                                         transition: isDraggingPan ? 'none' : 'transform 0.1s ease-out'
                                     }}
-                                    className="max-w-full max-h-full object-contain cursor-crosshair shadow-2xl"
-                                />
+                                >
+                                    <canvas
+                                        ref={origCanvasRef}
+                                        style={{ display: 'block', imageRendering: 'pixelated' }}
+                                        className="max-w-full max-h-full object-contain shadow-2xl"
+                                    />
+                                    {/* Brush Mask Overlay Canvas — pixel-perfect overlay over origCanvas */}
+                                    {isBrushMode && (
+                                        <canvas
+                                            ref={maskCanvasRef}
+                                            style={{
+                                                position: 'absolute',
+                                                top: 0,
+                                                left: 0,
+                                                width: '100%',
+                                                height: '100%',
+                                                imageRendering: 'pixelated',
+                                                pointerEvents: 'none'
+                                            }}
+                                        />
+                                    )}
+                                </div>
                             </div>
 
                             {/* Viewport Overlay — Bottom Left */}

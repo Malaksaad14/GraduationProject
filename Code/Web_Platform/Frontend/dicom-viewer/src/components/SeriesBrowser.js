@@ -29,15 +29,16 @@ function SliceThumbnailItem({
         try {
             const data = parsed.getSliceData(sliceIndex, timeFrameIndex);
             if (!data) return;
+            const info = parsed.getSliceInfo ? parsed.getSliceInfo(sliceIndex, timeFrameIndex) : null;
             renderSliceToCanvas(
                 canvasRef.current,
                 data,
-                parsed.cols,
-                parsed.rows,
-                parsed.defaultWindowCenter,
-                parsed.defaultWindowWidth,
-                parsed.min,
-                parsed.max
+                info?.cols || parsed.cols,
+                info?.rows || parsed.rows,
+                info?.wc ?? parsed.defaultWindowCenter,
+                info?.ww ?? parsed.defaultWindowWidth,
+                info?.min ?? parsed.min,
+                info?.max ?? parsed.max
             );
         } catch (e) {
             console.warn(e);
