@@ -19,6 +19,7 @@ db.sqlite3
 # Model Weights
 *.h5
 *.pt
+*.pth
 
 # Web platform upload/output directories
 Code/Web_Platform/fastapi_backend/uploads/*

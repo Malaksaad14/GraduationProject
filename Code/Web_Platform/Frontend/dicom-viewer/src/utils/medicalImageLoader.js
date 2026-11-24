@@ -618,10 +618,11 @@ export function renderSliceToCanvas(
     const getMaskRgb = (val, palette) => {
         const isGt = palette === 'groundTruth';
         const label = Math.round(val);
-        // Cardiac anatomical labels: 1 = LV Myo, 2 = LV Cavity / Blood Pool, 3 = RV
+        // Cardiac anatomical labels: 1 = Cavity, 2 = Myocardium, 3 = Infarction, 4 = No-Reflow
         if (label === 1) return isGt ? [16, 185, 129] : [6, 182, 212];    // Emerald (GT) vs Cyan (AI)
         if (label === 2) return isGt ? [239, 68, 68] : [168, 85, 247];    // Red (GT) vs Purple (AI)
         if (label === 3) return isGt ? [245, 158, 11] : [59, 130, 246];   // Amber (GT) vs Blue (AI)
+        if (label === 4) return isGt ? [236, 72, 153] : [244, 63, 94];    // Pink (GT) vs Rose (AI)
         if (label > 0) return isGt ? [16, 185, 129] : [6, 182, 212];      // Any other label
         return null;
     };

@@ -132,7 +132,7 @@ export async function localizeNifti(file) {
 export const sendToLocalizer = localizeDicom;
 
 /**
- * Run segmentation on a DICOM file.
+ * Run preprocessing and nnU-Net segmentation on a DICOM file.
  */
 export async function predictDicom(file) {
     const formData = new FormData();
@@ -148,11 +148,11 @@ export async function predictDicom(file) {
         throw new Error(err.detail || `Prediction failed (${response.status})`);
     }
 
-    return response;
+    return response.json();
 }
 
 /**
- * Run segmentation on a NIfTI file.
+ * Run preprocessing and nnU-Net segmentation on a NIfTI volume.
  */
 export async function predictNifti(file) {
     const formData = new FormData();
@@ -168,7 +168,7 @@ export async function predictNifti(file) {
         throw new Error(err.detail || `NIfTI prediction failed (${response.status})`);
     }
 
-    return response;
+    return response.json();
 }
 
 /**

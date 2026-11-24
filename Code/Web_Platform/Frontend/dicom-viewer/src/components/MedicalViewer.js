@@ -20,9 +20,10 @@ import {
     Sparkles,
     FolderOpen,
     Folder,
-    ShieldCheck
+    ShieldCheck,
+    Layers
 } from 'lucide-react';
-import { localizeDicom, localizeNifti, uploadDicom, uploadNifti, healthCheck } from '../api';
+import { localizeDicom, localizeNifti, predictDicom, predictNifti, uploadDicom, uploadNifti, healthCheck } from '../api';
 import {
     parseMedicalFile,
     renderSliceToCanvas,
@@ -230,6 +231,7 @@ export default function MedicalViewer() {
     const [isSplitView, setIsSplitView] = useState(false);
     const [clinicalData, setClinicalData] = useState(null);
     const [isLoadingLocalizer, setIsLoadingLocalizer] = useState(false);
+    const [isLoadingSegment, setIsLoadingSegment] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
     const [backendStatus, setBackendStatus] = useState('checking'); // 'online' | 'offline' | 'checking'
@@ -467,7 +469,9 @@ export default function MedicalViewer() {
 
         // Auto-adjust mask selection when switching scans
         if (selectedMaskType === 'gt' && !series.hasGtMask && !series.gtMask) {
-            setSelectedMaskType('none');
+            setSelectedMaskType(series.aiMask ? 'ai' : 'none');
+        } else if (selectedMaskType === 'ai' && !series.aiMask) {
+            setSelectedMaskType(series.hasGtMask || series.gtMask ? 'gt' : 'none');
         }
 
         setStatusMessage(`Active scan: ${series.filename} (${series.viewType || series.parsed.type.toUpperCase()})`);
@@ -623,6 +627,8 @@ export default function MedicalViewer() {
 
     const activeGtMask = currentSeriesObj?.gtMask || null;
     const hasMatchingGt = Boolean(activeGtMask || currentSeriesObj?.hasGtMask);
+    const activeAiMask = currentSeriesObj?.aiMask || null;
+    const hasAiMask = Boolean(activeAiMask);
 
     // ── Render Canvases ────────────────────────────────────────────────────────
     const renderViews = useCallback(() => {
@@ -637,6 +643,11 @@ export default function MedicalViewer() {
             const mTime = Math.min(currentTimeFrame, (activeGtMask.parsed.numTimeFrames || 1) - 1);
             currentMaskData = activeGtMask.parsed.getSliceData(mSlice, mTime);
             maskPalette = 'groundTruth';
+        } else if (selectedMaskType === 'ai' && activeAiMask && activeAiMask.parsed) {
+            const mSlice = Math.min(currentSlice, (activeAiMask.parsed.numSlices || 1) - 1);
+            const mTime = Math.min(currentTimeFrame, (activeAiMask.parsed.numTimeFrames || 1) - 1);
+            currentMaskData = activeAiMask.parsed.getSliceData(mSlice, mTime);
+            maskPalette = 'ai';
         }
 
         // Render Original Canvas (using spatial slice, cardiac time-frame, and optional mask overlay)
@@ -660,13 +671,23 @@ export default function MedicalViewer() {
             );
         }
 
-        // Render Localized Canvas if present (synchronized slice & phase)
+        // Render Localized / Preprocessed Canvas if present (synchronized slice & phase)
         if (isSplitView && parsedLocalized && locCanvasRef.current) {
-            const locSliceData = parsedLocalized.getSliceData(
-                Math.min(currentSlice, parsedLocalized.numSlices - 1),
-                Math.min(currentTimeFrame, (parsedLocalized.numTimeFrames || 1) - 1)
-            );
+            const locSliceIdx = Math.min(currentSlice, parsedLocalized.numSlices - 1);
+            const locTimeIdx = Math.min(currentTimeFrame, (parsedLocalized.numTimeFrames || 1) - 1);
+            const locSliceData = parsedLocalized.getSliceData(locSliceIdx, locTimeIdx);
             if (locSliceData) {
+                let locMaskData = null;
+                if (
+                    selectedMaskType === 'ai' &&
+                    activeAiMask?.roiParsed &&
+                    activeAiMask.roiParsed.cols === parsedLocalized.cols &&
+                    activeAiMask.roiParsed.rows === parsedLocalized.rows
+                ) {
+                    const roiSlice = Math.min(currentSlice, (activeAiMask.roiParsed.numSlices || 1) - 1);
+                    locMaskData = activeAiMask.roiParsed.getSliceData(roiSlice, 0);
+                }
+
                 // Use the localized volume's own window level so the ROI is always visible,
                 // regardless of the original scan's window/level settings.
                 const locWC = parsedLocalized.defaultWindowCenter;
@@ -679,7 +700,10 @@ export default function MedicalViewer() {
                     locWC,
                     locWW,
                     parsedLocalized.min,
-                    parsedLocalized.max
+                    parsedLocalized.max,
+                    locMaskData,
+                    maskOpacity,
+                    'ai'
                 );
             }
         }
@@ -694,7 +718,8 @@ export default function MedicalViewer() {
         windowWidth,
         selectedMaskType,
         maskOpacity,
-        activeGtMask
+        activeGtMask,
+        activeAiMask
     ]);
 
     useEffect(() => {
@@ -765,6 +790,114 @@ export default function MedicalViewer() {
         } finally {
             setIsLoadingLocalizer(false);
         }
+    };
+
+    // ── Run Full Preprocessing + nnU-Net Segmentation Pipeline ────────────────
+    const handleRunSegmentation = async () => {
+        if (!rawFile || !parsedOriginal) return;
+        setIsLoadingSegment(true);
+        setErrorMessage('');
+        setStatusMessage('Running preprocessing and nnU-Net segmentation...');
+
+        try {
+            const res = parsedOriginal.type === 'dicom'
+                ? await predictDicom(rawFile)
+                : await predictNifti(rawFile);
+
+            if (!res.mask_nifti_data) {
+                throw new Error('No segmentation mask returned by backend.');
+            }
+
+            const baseName = rawFile.name.replace(/\.nii(\.gz)?$/i, '').replace(/\.(dcm|dicom)$/i, '');
+            const maskBuffer = base64ToArrayBuffer(res.mask_nifti_data);
+            const parsedMask = await parseMedicalFile(maskBuffer, `${baseName}_pred.nii.gz`);
+
+            let parsedRoiMask = null;
+            if (res.roi_mask_nifti_data) {
+                const roiMaskBuffer = base64ToArrayBuffer(res.roi_mask_nifti_data);
+                parsedRoiMask = await parseMedicalFile(roiMaskBuffer, `${baseName}_roi_pred.nii.gz`);
+            }
+
+            let parsedPreprocessed = null;
+            if (res.preprocessed_nifti_data) {
+                const prepBuffer = base64ToArrayBuffer(res.preprocessed_nifti_data);
+                parsedPreprocessed = await parseMedicalFile(prepBuffer, `preprocessed_${baseName}.nii.gz`);
+                const rawPrep = { base64: res.preprocessed_nifti_data, format: 'nifti' };
+                setLocalizedRawData(rawPrep);
+                setParsedLocalized(parsedPreprocessed);
+                setIsSplitView(true);
+            }
+
+            const aiMaskObj = {
+                parsed: parsedMask,
+                roiParsed: parsedRoiMask,
+                base64: res.mask_nifti_data,
+                roiBase64: res.roi_mask_nifti_data || null,
+                labelCounts: res.label_counts || {},
+                labels: res.labels || {},
+            };
+
+            setSeriesList((prevList) =>
+                prevList.map((s) => {
+                    if (s.id === activeSeriesId) {
+                        return {
+                            ...s,
+                            aiMask: aiMaskObj,
+                            hasAiMask: true,
+                            ...(parsedPreprocessed
+                                ? {
+                                      hasLocalization: true,
+                                      localizedResult: {
+                                          parsed: parsedPreprocessed,
+                                          raw: { base64: res.preprocessed_nifti_data, format: 'nifti' }
+                                      }
+                                  }
+                                : {})
+                        };
+                    }
+                    return s;
+                })
+            );
+
+            setSelectedMaskType('ai');
+
+            const summary = Object.entries(res.label_counts || {})
+                .filter(([, count]) => count > 0)
+                .map(([name, count]) => `${name}: ${count}`)
+                .join(' · ');
+            setStatusMessage(
+                summary
+                    ? `Segmentation complete! (${summary})`
+                    : 'Segmentation complete! AI mask overlaid on scan.'
+            );
+        } catch (err) {
+            console.error('Segmentation error:', err);
+            setErrorMessage(`Segmentation failed: ${err.message}`);
+            setStatusMessage('');
+        } finally {
+            setIsLoadingSegment(false);
+        }
+    };
+
+    const handleDownloadAiMask = () => {
+        if (!activeAiMask?.base64) return;
+        const baseName = rawFile?.name
+            ? rawFile.name.replace(/\.nii(\.gz)?$/i, '').replace(/\.(dcm|dicom)$/i, '')
+            : 'scan';
+        const byteCharacters = atob(activeAiMask.base64);
+        const byteNumbers = new Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) {
+            byteNumbers[i] = byteCharacters.charCodeAt(i);
+        }
+        const blob = new Blob([new Uint8Array(byteNumbers)], { type: 'application/gzip' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${baseName}_pred.nii.gz`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
     };
 
     // ── Download Handler for Localized Output ────────────────────────────────
@@ -878,9 +1011,10 @@ export default function MedicalViewer() {
         for (let i = 0; i < sliceMask.length; i++) {
             const label = sliceMask[i];
             if (label > 0) {
-                let rgb = [16, 185, 129]; // Label 1: Emerald (LV Myo)
-                if (label === 2) rgb = [239, 68, 68];       // Label 2: Red (LV Cavity)
-                else if (label === 3) rgb = [245, 158, 11]; // Label 3: Amber (RV / Scar)
+                let rgb = [6, 182, 212]; // Label 1: Cyan (Cavity)
+                if (label === 2) rgb = [168, 85, 247];      // Label 2: Purple (Myocardium)
+                else if (label === 3) rgb = [245, 158, 11]; // Label 3: Amber (Infarction)
+                else if (label === 4) rgb = [244, 63, 94];  // Label 4: Rose (No-Reflow)
                 imgData.data[i * 4]     = rgb[0];
                 imgData.data[i * 4 + 1] = rgb[1];
                 imgData.data[i * 4 + 2] = rgb[2];
@@ -897,16 +1031,23 @@ export default function MedicalViewer() {
         setBrushMaskData((prev) => {
             const map = prev ? new Map(prev) : new Map();
 
+            const sourceMaskParsed =
+                selectedMaskType === 'gt' && activeGtMask?.parsed
+                    ? activeGtMask.parsed
+                    : selectedMaskType === 'ai' && activeAiMask?.parsed
+                    ? activeAiMask.parsed
+                    : activeAiMask?.parsed || activeGtMask?.parsed || null;
+
             for (let s = 0; s < parsedOriginal.numSlices; s++) {
                 if (!map.has(s)) {
                     const sInfo = parsedOriginal.getSliceInfo ? parsedOriginal.getSliceInfo(s, 0) : null;
                     const cols = sInfo?.cols || parsedOriginal.cols;
                     const rows = sInfo?.rows || parsedOriginal.rows;
                     const sliceArr = new Uint8Array(rows * cols);
-                    // If GT mask is currently active, preserve its integer labels (1, 2, 3...)
-                    if (selectedMaskType === 'gt' && activeGtMask?.parsed) {
-                        const mSlice = Math.min(s, (activeGtMask.parsed.numSlices || 1) - 1);
-                        const existingMask = activeGtMask.parsed.getSliceData(mSlice, 0);
+                    // Preserve integer labels (1, 2, 3, 4...) from active GT or AI mask
+                    if (sourceMaskParsed) {
+                        const mSlice = Math.min(s, (sourceMaskParsed.numSlices || 1) - 1);
+                        const existingMask = sourceMaskParsed.getSliceData(mSlice, 0);
                         if (existingMask) {
                             for (let i = 0; i < Math.min(sliceArr.length, existingMask.length); i++) {
                                 sliceArr[i] = existingMask[i] > 0 ? Math.min(255, Math.round(existingMask[i])) : 0;
@@ -918,7 +1059,7 @@ export default function MedicalViewer() {
             }
             return map;
         });
-    }, [parsedOriginal, selectedMaskType, activeGtMask]);
+    }, [parsedOriginal, selectedMaskType, activeGtMask, activeAiMask]);
 
     // ── Brush: convert display coords → image pixel coords ───────────────────
     const displayToImageCoords = useCallback((clientX, clientY) => {
@@ -1192,9 +1333,9 @@ export default function MedicalViewer() {
                     {/* Run Localizer */}
                     <button
                         onClick={handleSendToLocalizer}
-                        disabled={!parsedOriginal || isLoadingLocalizer}
+                        disabled={!parsedOriginal || isLoadingLocalizer || isLoadingSegment}
                         className={`flex items-center gap-1.5 px-3 py-1 rounded border font-mono transition flex-shrink-0 ${
-                            !parsedOriginal || isLoadingLocalizer
+                            !parsedOriginal || isLoadingLocalizer || isLoadingSegment
                                 ? 'border-white/8 text-white/20 cursor-not-allowed'
                                 : 'border-white/20 text-white/60 hover:border-white/40 hover:text-white/90'
                         }`}
@@ -1206,6 +1347,30 @@ export default function MedicalViewer() {
                             </>
                         ) : (
                             <span>Run Localizer</span>
+                        )}
+                    </button>
+
+                    {/* Run Segmentation */}
+                    <button
+                        onClick={handleRunSegmentation}
+                        disabled={!parsedOriginal || isLoadingSegment || isLoadingLocalizer}
+                        className={`flex items-center gap-1.5 px-3 py-1 rounded border font-mono transition flex-shrink-0 ${
+                            !parsedOriginal || isLoadingSegment || isLoadingLocalizer
+                                ? 'border-white/8 text-white/20 cursor-not-allowed'
+                                : 'border-cyan-500/40 text-cyan-300/85 hover:border-cyan-400 hover:text-cyan-200 bg-cyan-500/10'
+                        }`}
+                        title="Preprocess volume and run nnU-Net segmentation"
+                    >
+                        {isLoadingSegment ? (
+                            <>
+                                <div className="w-3 h-3 border border-cyan-400 border-t-transparent rounded-full animate-spin" />
+                                <span>Segmenting...</span>
+                            </>
+                        ) : (
+                            <>
+                                <Layers className="w-3.5 h-3.5" />
+                                <span>Run Segmentation</span>
+                            </>
                         )}
                     </button>
 
@@ -1280,6 +1445,42 @@ export default function MedicalViewer() {
                         </div>
                     )}
 
+                    {/* AI Mask controls */}
+                    {hasAiMask && (
+                        <>
+                            <div className="h-5 w-px bg-white/8 mx-0.5 flex-shrink-0" />
+                            <div className="flex items-center bg-white/5 rounded border border-cyan-500/30 px-1 gap-1 flex-shrink-0">
+                                <button
+                                    onClick={() => setSelectedMaskType((prev) => (prev === 'ai' ? 'none' : 'ai'))}
+                                    className={`flex items-center gap-1 px-2 py-1 rounded font-mono text-xs transition cursor-pointer ${
+                                        selectedMaskType === 'ai' ? 'bg-cyan-500/20 text-cyan-200' : 'text-white/40 hover:text-white/75'
+                                    }`}
+                                >
+                                    <Layers className="w-3.5 h-3.5" />
+                                    <span>{selectedMaskType === 'ai' ? 'AI: ON' : 'AI Mask'}</span>
+                                </button>
+                                {selectedMaskType === 'ai' && (
+                                    <div className="flex items-center gap-1 pl-1 border-l border-white/8">
+                                        <input
+                                            type="range" min="0.1" max="0.9" step="0.05"
+                                            value={maskOpacity}
+                                            onChange={(e) => setMaskOpacity(Number(e.target.value))}
+                                            className="w-12 accent-cyan-400 h-1 bg-white/10 rounded cursor-pointer"
+                                        />
+                                        <span className="text-[10px] text-white/40 font-mono w-6">{Math.round(maskOpacity * 100)}%</span>
+                                    </div>
+                                )}
+                                <button
+                                    onClick={handleDownloadAiMask}
+                                    className="border-l border-white/8 pl-1.5 pr-1 py-0.5 text-[10px] font-mono text-cyan-300/70 hover:text-cyan-200 transition cursor-pointer"
+                                    title="Download predicted segmentation mask (.nii.gz)"
+                                >
+                                    <Download className="w-3 h-3" />
+                                </button>
+                            </div>
+                        </>
+                    )}
+
                     {/* GT Mask controls */}
                     {hasMatchingGt && (
                         <>
@@ -1334,12 +1535,13 @@ export default function MedicalViewer() {
 
                                 {isBrushMode && (
                                     <>
-                                        {/* Region / Label selector (1, 2, 3) */}
+                                        {/* Region / Label selector (1, 2, 3, 4) */}
                                         <div className="flex items-center border-l border-white/8 pl-1 gap-0.5">
                                             {[
-                                                { id: 1, name: 'L1', title: 'Region 1 (LV Myo)', dot: 'bg-emerald-500' },
-                                                { id: 2, name: 'L2', title: 'Region 2 (LV Cavity)', dot: 'bg-red-500' },
-                                                { id: 3, name: 'L3', title: 'Region 3 (RV / Scar)', dot: 'bg-amber-500' },
+                                                { id: 1, name: 'L1', title: 'Region 1 (LV Cavity)', dot: 'bg-cyan-500' },
+                                                { id: 2, name: 'L2', title: 'Region 2 (Myocardium)', dot: 'bg-purple-500' },
+                                                { id: 3, name: 'L3', title: 'Region 3 (Infarction)', dot: 'bg-amber-500' },
+                                                { id: 4, name: 'L4', title: 'Region 4 (No-Reflow)', dot: 'bg-rose-500' },
                                             ].map((lbl) => (
                                                 <button
                                                     key={lbl.id}
@@ -1699,6 +1901,9 @@ export default function MedicalViewer() {
                                 <span>{parsedOriginal.type.toUpperCase()}</span>
                                 {selectedMaskType === 'gt' && (
                                     <span className="text-white/60 border border-white/15 px-1 rounded">GT</span>
+                                )}
+                                {selectedMaskType === 'ai' && (
+                                    <span className="text-cyan-300 border border-cyan-500/30 px-1 rounded">AI</span>
                                 )}
                                 {activeStudyObj && (
                                     <button
