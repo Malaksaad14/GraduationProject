@@ -38,6 +38,14 @@ import ClinicalDataPanel from './ClinicalDataPanel';
 import SeriesBrowser from './SeriesBrowser';
 import StudyHierarchyBrowser from './StudyHierarchyBrowser';
 
+// ── Cardiac Segmentation Label Metadata (EMIDEC) ─────────────────────────────
+const SEGMENTATION_REGIONS = [
+    { id: 1, key: 'cavity', name: 'Cavity', aiDot: 'bg-cyan-500', gtDot: 'bg-emerald-500', textClass: 'text-cyan-300', gtTextClass: 'text-emerald-300' },
+    { id: 2, key: 'myocardium', name: 'Myocardium', aiDot: 'bg-purple-500', gtDot: 'bg-red-500', textClass: 'text-purple-300', gtTextClass: 'text-red-300' },
+    { id: 3, key: 'infarction', name: 'Infarction', aiDot: 'bg-amber-500', gtDot: 'bg-amber-500', textClass: 'text-amber-300', gtTextClass: 'text-amber-300' },
+    { id: 4, key: 'no_reflow', name: 'No-Reflow', aiDot: 'bg-rose-500', gtDot: 'bg-pink-500', textClass: 'text-rose-300', gtTextClass: 'text-pink-300' },
+];
+
 // ── Recursive Directory Tree Helpers & Component ─────────────────────────────
 function checkDescendantMatches(node, q) {
     if (!node || !node.children) return false;
@@ -236,7 +244,7 @@ export default function MedicalViewer() {
     const [errorMessage, setErrorMessage] = useState('');
     const [backendStatus, setBackendStatus] = useState('checking'); // 'online' | 'offline' | 'checking'
     const [showShortcutsModal, setShowShortcutsModal] = useState(false);
-    const [mousePos, setMousePos] = useState({ x: 0, y: 0, value: 'N/A' });
+    const [mousePos, setMousePos] = useState({ x: 0, y: 0, value: 'N/A', region: null });
     const [isPlayingCine, setIsPlayingCine] = useState(false);
     const [isDragOver, setIsDragOver] = useState(false);
     const [isUploadMenuOpen, setIsUploadMenuOpen] = useState(false);
@@ -954,12 +962,39 @@ export default function MedicalViewer() {
     const handleMouseMove = (e) => {
         if (!parsedOriginal) return;
 
-        // Update Mouse Position info
+        // Update Mouse Position & hovered segmentation region info
         const rect = origCanvasRef.current?.getBoundingClientRect();
-        if (rect) {
-            const mouseX = Math.round(((e.clientX - rect.left) / rect.width) * activeSliceCols);
-            const mouseY = Math.round(((e.clientY - rect.top) / rect.height) * activeSliceRows);
-            setMousePos({ x: mouseX, y: mouseY, value: 'Active' });
+        const locRect = isSplitView ? locCanvasRef.current?.getBoundingClientRect() : null;
+        let hoveredRegion = null;
+
+        const readHoveredLabel = (x, y, cols, rows, sliceArr) => {
+            if (!sliceArr || x < 0 || y < 0 || x >= cols || y >= rows) return null;
+            const lbl = Math.round(sliceArr[y * cols + x] || 0);
+            if (lbl <= 0) return null;
+            return SEGMENTATION_REGIONS.find((r) => r.id === lbl)?.name || `Label ${lbl}`;
+        };
+
+        if (rect && e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+            const mouseX = Math.floor(((e.clientX - rect.left) / rect.width) * activeSliceCols);
+            const mouseY = Math.floor(((e.clientY - rect.top) / rect.height) * activeSliceRows);
+            if (isBrushMode && brushMaskData?.get(currentSlice)) {
+                hoveredRegion = readHoveredLabel(mouseX, mouseY, activeSliceCols, activeSliceRows, brushMaskData.get(currentSlice));
+            } else if (selectedMaskType === 'ai' && activeAiMask?.parsed) {
+                const mSlice = Math.min(currentSlice, (activeAiMask.parsed.numSlices || 1) - 1);
+                hoveredRegion = readHoveredLabel(mouseX, mouseY, activeSliceCols, activeSliceRows, activeAiMask.parsed.getSliceData(mSlice, 0));
+            } else if (selectedMaskType === 'gt' && activeGtMask?.parsed) {
+                const mSlice = Math.min(currentSlice, (activeGtMask.parsed.numSlices || 1) - 1);
+                hoveredRegion = readHoveredLabel(mouseX, mouseY, activeSliceCols, activeSliceRows, activeGtMask.parsed.getSliceData(mSlice, 0));
+            }
+            setMousePos({ x: mouseX, y: mouseY, value: 'Active', region: hoveredRegion });
+        } else if (locRect && parsedLocalized && e.clientX >= locRect.left && e.clientX <= locRect.right && e.clientY >= locRect.top && e.clientY <= locRect.bottom) {
+            const mouseX = Math.floor(((e.clientX - locRect.left) / locRect.width) * parsedLocalized.cols);
+            const mouseY = Math.floor(((e.clientY - locRect.top) / locRect.height) * parsedLocalized.rows);
+            if (selectedMaskType === 'ai' && activeAiMask?.roiParsed) {
+                const roiSlice = Math.min(currentSlice, (activeAiMask.roiParsed.numSlices || 1) - 1);
+                hoveredRegion = readHoveredLabel(mouseX, mouseY, parsedLocalized.cols, parsedLocalized.rows, activeAiMask.roiParsed.getSliceData(roiSlice, 0));
+            }
+            setMousePos({ x: mouseX, y: mouseY, value: 'Active', region: hoveredRegion });
         }
 
         if (isBrushMode) {
@@ -1972,7 +2007,37 @@ export default function MedicalViewer() {
                                 <span>L: {Math.round(windowCenter)}</span>
                                 <span>{zoom.toFixed(2)}x</span>
                                 <span>{mousePos.x},{mousePos.y}</span>
+                                {mousePos.region && (
+                                    <span className="text-cyan-300 border-l border-white/10 pl-2 font-semibold">
+                                        {mousePos.region}
+                                    </span>
+                                )}
                             </div>
+
+                            {/* Viewport Overlay — Bottom Right: Mask Color Legend */}
+                            {(isBrushMode || selectedMaskType === 'ai' || (selectedMaskType === 'gt' && hasMatchingGt)) && (
+                                <div className="absolute bottom-2 right-2 z-10 bg-[#0d1b2a]/85 border border-white/10 px-2.5 py-1.5 rounded text-[10px] font-mono text-white/75 space-y-1 pointer-events-none">
+                                    <div className="text-[9px] uppercase tracking-wider text-white/40 border-b border-white/10 pb-0.5">
+                                        {isBrushMode ? 'Brush Regions' : selectedMaskType === 'gt' ? 'GT Regions' : 'AI Segmentation'}
+                                    </div>
+                                    {SEGMENTATION_REGIONS.map((reg) => {
+                                        const isGtPalette = !isBrushMode && selectedMaskType === 'gt';
+                                        const dotClass = isGtPalette ? reg.gtDot : reg.aiDot;
+                                        const count = !isGtPalette && activeAiMask?.labelCounts ? activeAiMask.labelCounts[reg.key] : undefined;
+                                        return (
+                                            <div key={reg.id} className="flex items-center justify-between gap-3">
+                                                <div className="flex items-center gap-1.5">
+                                                    <span className={`w-2.5 h-2.5 rounded-sm ${dotClass}`} />
+                                                    <span>L{reg.id} {reg.name}</span>
+                                                </div>
+                                                {typeof count === 'number' && (
+                                                    <span className="text-white/40">{count.toLocaleString()}</span>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
                         </div>
 
                         {/* VIEWPORT 2: LOCALIZED SCAN (SPLIT VIEW) */}
@@ -2021,9 +2086,37 @@ export default function MedicalViewer() {
                                 </div>
 
                                 {/* Viewport 2 — Bottom Left */}
-                                <div className="absolute bottom-2 left-2 z-10 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/35">
-                                    Synchronized · LV ROI
+                                <div className="absolute bottom-2 left-2 z-10 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/35 flex items-center gap-2">
+                                    <span>Synchronized · LV ROI</span>
+                                    {mousePos.region && (
+                                        <span className="text-cyan-300 border-l border-white/10 pl-2 font-semibold">
+                                            {mousePos.region}
+                                        </span>
+                                    )}
                                 </div>
+
+                                {/* Viewport 2 — Bottom Right: Mask Color Legend */}
+                                {selectedMaskType === 'ai' && activeAiMask?.roiParsed && (
+                                    <div className="absolute bottom-2 right-2 z-10 bg-[#0d1b2a]/85 border border-white/10 px-2.5 py-1.5 rounded text-[10px] font-mono text-white/75 space-y-1 pointer-events-none">
+                                        <div className="text-[9px] uppercase tracking-wider text-white/40 border-b border-white/10 pb-0.5">
+                                            AI Regions
+                                        </div>
+                                        {SEGMENTATION_REGIONS.map((reg) => {
+                                            const count = activeAiMask?.labelCounts ? activeAiMask.labelCounts[reg.key] : undefined;
+                                            return (
+                                                <div key={reg.id} className="flex items-center justify-between gap-3">
+                                                    <div className="flex items-center gap-1.5">
+                                                        <span className={`w-2.5 h-2.5 rounded-sm ${reg.aiDot}`} />
+                                                        <span>L{reg.id} {reg.name}</span>
+                                                    </div>
+                                                    {typeof count === 'number' && (
+                                                        <span className="text-white/40">{count.toLocaleString()}</span>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
                             </div>
                         )}
                     </div>

@@ -1,0 +1,12 @@
+{
+  "dataset": "EMIDEC",
+  "roi_size": 128,
+  "clip_low": 1806.0,
+  "clip_high": 3093.0,
+  "bundle_dir": "/home/amr/Study/Graduation Project/Code/GP26_DEInf_Data_Preprocessing/models/Monai",
+  "model_config_name": "train.json",
+  "model_path": "/home/amr/Study/Graduation Project/Code/GP26_DEInf_Data_Preprocessing/models/Monai/models/model.pt",
+  "low_percentile": 2,
+  "high_percentile": 98,
+  "version": 1
+}
