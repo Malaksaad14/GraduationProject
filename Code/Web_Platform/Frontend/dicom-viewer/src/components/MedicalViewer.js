@@ -1225,9 +1225,9 @@ export default function MedicalViewer() {
             </header>
 
             {/* ── CONTROL TOOLBAR ── */}
-            <div className="h-11 bg-[#0d1b2a] border-b border-white/10 px-3 flex items-center justify-between text-xs z-40 gap-2 select-none overflow-x-auto">
+            <div className="min-h-[2.75rem] bg-[#0d1b2a] border-b border-white/10 px-3 py-1 flex flex-wrap items-center justify-between text-xs z-40 gap-2 select-none relative overflow-visible">
                 {/* Left group */}
-                <div className="flex items-center gap-1.5 flex-shrink-0">
+                <div className="flex flex-wrap items-center gap-1.5">
                     {/* Hidden file inputs */}
                     <input type="file" ref={fileInputRef} onChange={handleFileChange} accept=".dcm,.dicom,.nii,.nii.gz" multiple className="hidden" />
                     <input type="file" ref={folderInputRef} onChange={handleFolderChange} webkitdirectory="true" directory="" multiple className="hidden" />
