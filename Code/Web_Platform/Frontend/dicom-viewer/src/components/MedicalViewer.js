@@ -6,6 +6,7 @@ import {
     RotateCcw,
     RotateCw,
     Maximize2,
+    Undo2,
     Sun,
     Move,
     ZoomIn,
@@ -43,10 +44,10 @@ import StudyHierarchyBrowser from './StudyHierarchyBrowser';
 
 // ── Cardiac Segmentation Label Metadata (EMIDEC) ─────────────────────────────
 const SEGMENTATION_REGIONS = [
-    { id: 1, key: 'cavity', name: 'Cavity', aiDot: 'bg-cyan-500', gtDot: 'bg-emerald-500', textClass: 'text-cyan-300', gtTextClass: 'text-emerald-300' },
-    { id: 2, key: 'myocardium', name: 'Myocardium', aiDot: 'bg-purple-500', gtDot: 'bg-red-500', textClass: 'text-purple-300', gtTextClass: 'text-red-300' },
+    { id: 1, key: 'cavity', name: 'Cavity', aiDot: 'bg-cyan-500', gtDot: 'bg-cyan-500', textClass: 'text-cyan-300', gtTextClass: 'text-cyan-300' },
+    { id: 2, key: 'myocardium', name: 'Myocardium', aiDot: 'bg-purple-500', gtDot: 'bg-purple-500', textClass: 'text-purple-300', gtTextClass: 'text-purple-300' },
     { id: 3, key: 'infarction', name: 'Infarction', aiDot: 'bg-amber-500', gtDot: 'bg-amber-500', textClass: 'text-amber-300', gtTextClass: 'text-amber-300' },
-    { id: 4, key: 'no_reflow', name: 'No-Reflow', aiDot: 'bg-rose-500', gtDot: 'bg-pink-500', textClass: 'text-rose-300', gtTextClass: 'text-pink-300' },
+    { id: 4, key: 'no_reflow', name: 'No-Reflow', aiDot: 'bg-rose-500', gtDot: 'bg-rose-500', textClass: 'text-rose-300', gtTextClass: 'text-rose-300' },
 ];
 
 // ── Recursive Directory Tree Helpers & Component ─────────────────────────────
@@ -98,13 +99,12 @@ function DirectoryTreeNode({
                     }
                 }}
                 style={{ paddingLeft: `${depth * 12 + 6}px` }}
-                className={`group py-1.5 pr-2 rounded cursor-pointer border transition duration-150 flex items-center justify-between ${
-                    isActive
-                        ? 'bg-white/15 border-white/30 text-white font-semibold'
-                        : hasActiveChild
+                className={`group py-1.5 pr-2 rounded cursor-pointer border transition duration-150 flex items-center justify-between ${isActive
+                    ? 'bg-white/15 border-white/30 text-white font-semibold'
+                    : hasActiveChild
                         ? 'bg-white/5 border-white/15 text-white/90'
                         : 'border-transparent hover:bg-white/5 text-white/65 hover:text-white'
-                }`}
+                    }`}
                 title={node.fullPath || node.name}
             >
                 <div className="flex items-center gap-1.5 min-w-0 truncate">
@@ -132,22 +132,20 @@ function DirectoryTreeNode({
                         <Folder className={`w-3.5 h-3.5 flex-shrink-0 ${isExpanded ? 'text-white/70' : 'text-white/40'}`} />
                     ) : null}
 
-                    <span className={`truncate text-[11px] ${
-                        isActive
-                            ? 'text-white'
-                            : hasActiveChild
+                    <span className={`truncate text-[11px] ${isActive
+                        ? 'text-white'
+                        : hasActiveChild
                             ? 'text-white/90 font-medium'
                             : 'text-white/70 group-hover:text-white'
-                    }`}>
+                        }`}>
                         {node.name}
                     </span>
                 </div>
 
                 <div className="flex items-center gap-1 ml-1 flex-shrink-0">
                     {isStudyNode ? (
-                        <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${
-                            isActive ? 'bg-white/20 text-white font-bold' : 'bg-white/5 text-white/30'
-                        }`}>
+                        <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${isActive ? 'bg-white/20 text-white font-bold' : 'bg-white/5 text-white/30'
+                            }`}>
                             {node.study.imageCount} imgs
                         </span>
                     ) : (
@@ -195,10 +193,13 @@ export default function MedicalViewer() {
     // ── Brush / Mask Editor State ──────────────────────────────────────────────
     const [isBrushMode, setIsBrushMode] = useState(false);       // brush tool active?
     const [brushTool, setBrushTool] = useState('draw');           // 'draw' | 'erase'
-    const [brushLabel, setBrushLabel] = useState(1);              // 1: LV Myo, 2: LV Cavity, 3: RV
+    const [brushLabel, setBrushLabel] = useState(1);              // 1: Cavity, 2: Myocardium, 3: Infarction, 4: No-Reflow
     const [brushSize, setBrushSize] = useState(10);               // radius in image pixels
     const [brushMaskData, setBrushMaskData] = useState(null);     // Map: sliceIdx → Uint8Array(rows*cols)
+    const [brushMaskSource, setBrushMaskSource] = useState(null); // 'ai' | 'gt' | 'freehand' | null
+    const [brushHistory, setBrushHistory] = useState([]);         // Undo stack: [{ sliceIndex, data: Uint8Array }]
     const [isBrushDrawing, setIsBrushDrawing] = useState(false);
+    const lastBrushPosRef = useRef(null);
 
     // ── Multi-Scan / Patient Folder Series State ──────────────────────────────
     const [seriesList, setSeriesList] = useState([]);
@@ -468,6 +469,7 @@ export default function MedicalViewer() {
         setIsPlayingCine(false);
         setIsBrushMode(false);
         setBrushMaskData(null);
+        setBrushHistory([]);
 
         // Restore cached localized view if available
         if (series.localizedResult) {
@@ -651,7 +653,17 @@ export default function MedicalViewer() {
         let currentMaskData = null;
         let maskPalette = 'groundTruth';
 
-        if (selectedMaskType === 'gt' && activeGtMask && activeGtMask.parsed) {
+        if (isBrushMode) {
+            // When in brush mode, origCanvasRef renders the pure anatomical scan,
+            // while maskCanvasRef renders brushMaskData on top. This ensures the eraser
+            // actually removes pixels and reveals the bare grayscale scan, rather than
+            // showing an underlying baked mask!
+            currentMaskData = null;
+        } else if (brushMaskData?.get(currentSlice)) {
+            // When not actively editing, if user has edited with the brush, display their edited mask
+            currentMaskData = brushMaskData.get(currentSlice);
+            maskPalette = selectedMaskType === 'gt' ? 'groundTruth' : 'ai';
+        } else if (selectedMaskType === 'gt' && activeGtMask && activeGtMask.parsed) {
             const mSlice = Math.min(currentSlice, (activeGtMask.parsed.numSlices || 1) - 1);
             const mTime = Math.min(currentTimeFrame, (activeGtMask.parsed.numTimeFrames || 1) - 1);
             currentMaskData = activeGtMask.parsed.getSliceData(mSlice, mTime);
@@ -732,7 +744,9 @@ export default function MedicalViewer() {
         selectedMaskType,
         maskOpacity,
         activeGtMask,
-        activeAiMask
+        activeAiMask,
+        isBrushMode,
+        brushMaskData
     ]);
 
     useEffect(() => {
@@ -747,7 +761,7 @@ export default function MedicalViewer() {
             cancelAnimationFrame(animId);
             clearTimeout(timer);
         };
-    }, [renderViews, isSplitView, parsedLocalized, currentSlice, currentTimeFrame]);
+    }, [renderViews, isSplitView, parsedLocalized, currentSlice, currentTimeFrame, isBrushMode]);
 
     const [localizedRawData, setLocalizedRawData] = useState(null);
     const [isDownloadMenuOpen, setIsDownloadMenuOpen] = useState(false);
@@ -859,12 +873,12 @@ export default function MedicalViewer() {
                             hasAiMask: true,
                             ...(parsedPreprocessed
                                 ? {
-                                      hasLocalization: true,
-                                      localizedResult: {
-                                          parsed: parsedPreprocessed,
-                                          raw: { base64: res.preprocessed_nifti_data, format: 'nifti' }
-                                      }
-                                  }
+                                    hasLocalization: true,
+                                    localizedResult: {
+                                        parsed: parsedPreprocessed,
+                                        raw: { base64: res.preprocessed_nifti_data, format: 'nifti' }
+                                    }
+                                }
                                 : {})
                         };
                     }
@@ -873,6 +887,7 @@ export default function MedicalViewer() {
             );
 
             setSelectedMaskType('ai');
+            setBrushMaskData(null); // Reset brush mask so it cleanly clones the new AI segmentation
 
             const summary = Object.entries(res.label_counts || {})
                 .filter(([, count]) => count > 0)
@@ -956,6 +971,14 @@ export default function MedicalViewer() {
     const handleMouseDown = (e) => {
         if (!parsedOriginal) return;
         if (isBrushMode) {
+            // Snapshot current slice state before each stroke for undo
+            const currentSliceData = brushMaskData?.get(currentSlice);
+            if (currentSliceData) {
+                setBrushHistory((prev) => [
+                    ...prev.slice(-19), // keep max 20 entries
+                    { sliceIndex: currentSlice, data: new Uint8Array(currentSliceData) },
+                ]);
+            }
             setIsBrushDrawing(true);
             paintBrush(e.clientX, e.clientY);
             return;
@@ -1053,11 +1076,14 @@ export default function MedicalViewer() {
         for (let i = 0; i < sliceMask.length; i++) {
             const label = sliceMask[i];
             if (label > 0) {
-                let rgb = [6, 182, 212]; // Label 1: Cyan (Cavity)
-                if (label === 2) rgb = [168, 85, 247];      // Label 2: Purple (Myocardium)
-                else if (label === 3) rgb = [245, 158, 11]; // Label 3: Amber (Infarction)
-                else if (label === 4) rgb = [244, 63, 94];  // Label 4: Rose (No-Reflow)
-                imgData.data[i * 4]     = rgb[0];
+                const labelColors = {
+                    1: [6, 182, 212],   // Cavity – cyan (matches aiDot bg-cyan-500)
+                    2: [168, 85, 247], // Myocardium – purple (matches aiDot bg-purple-500)
+                    3: [245, 158, 11], // Infarction – amber (matches aiDot bg-amber-500)
+                    4: [244, 63, 94]   // No‑Reflow – rose (matches aiDot bg-rose-500)
+                };
+                const rgb = labelColors[label] || [0, 0, 0];
+                imgData.data[i * 4] = rgb[0];
                 imgData.data[i * 4 + 1] = rgb[1];
                 imgData.data[i * 4 + 2] = rgb[2];
                 imgData.data[i * 4 + 3] = alpha;
@@ -1069,6 +1095,8 @@ export default function MedicalViewer() {
     // ── Brush: initialize mask (prefill from active GT/AI mask if available) ──
     const handleStartBrushMode = useCallback(() => {
         if (!parsedOriginal) return;
+        // Reset undo history when starting a new brush session
+        setBrushHistory([]);
         setIsBrushMode(true);
         setBrushMaskData((prev) => {
             const map = prev ? new Map(prev) : new Map();
@@ -1077,8 +1105,8 @@ export default function MedicalViewer() {
                 selectedMaskType === 'gt' && activeGtMask?.parsed
                     ? activeGtMask.parsed
                     : selectedMaskType === 'ai' && activeAiMask?.parsed
-                    ? activeAiMask.parsed
-                    : activeAiMask?.parsed || activeGtMask?.parsed || null;
+                        ? activeAiMask.parsed
+                        : activeAiMask?.parsed || activeGtMask?.parsed || null;
 
             for (let s = 0; s < parsedOriginal.numSlices; s++) {
                 if (!map.has(s)) {
@@ -1092,7 +1120,7 @@ export default function MedicalViewer() {
                         const existingMask = sourceMaskParsed.getSliceData(mSlice, 0);
                         if (existingMask) {
                             for (let i = 0; i < Math.min(sliceArr.length, existingMask.length); i++) {
-                                sliceArr[i] = existingMask[i] > 0 ? Math.min(255, Math.round(existingMask[i])) : 0;
+                                sliceArr[i] = existingMask[i];   // keep original label values (0-4)
                             }
                         }
                     }
@@ -1244,6 +1272,18 @@ export default function MedicalViewer() {
         setRotation(0);
     }, []);
 
+    // ── Undo: revert last brush stroke on current slice ───────────────────────
+    const handleUndo = useCallback(() => {
+        if (brushHistory.length === 0) return;
+        const last = brushHistory[brushHistory.length - 1];
+        setBrushMaskData((prev) => {
+            const map = new Map(prev);
+            map.set(last.sliceIndex, last.data);
+            return map;
+        });
+        setBrushHistory((prev) => prev.slice(0, -1));
+    }, [brushHistory]);
+
     // ── Anatomical Patient Orientation (Dynamically updates with rotation) ───
     const orientation = useMemo(() => {
         return getAnatomicalOrientation(parsedOriginal, currentSlice, currentTimeFrame, rotation);
@@ -1253,6 +1293,14 @@ export default function MedicalViewer() {
     useEffect(() => {
         const handleKeyDown = (e) => {
             if (['INPUT', 'TEXTAREA'].includes(e.target?.tagName)) return;
+            // Undo: Ctrl+Z while in brush mode
+            if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+                if (isBrushMode) {
+                    e.preventDefault();
+                    handleUndo();
+                }
+                return;
+            }
             if (e.key === 'r' || e.key === 'R') {
                 e.preventDefault();
                 if (e.shiftKey) {
@@ -1264,7 +1312,7 @@ export default function MedicalViewer() {
         };
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [handleRotateCw, handleRotateCcw]);
+    }, [handleRotateCw, handleRotateCcw, handleUndo, isBrushMode]);
 
     return (
         <div className="flex flex-col h-screen bg-[#070b12] text-slate-100 font-sans select-none overflow-hidden">
@@ -1371,11 +1419,10 @@ export default function MedicalViewer() {
                                                 <button
                                                     key={study.id}
                                                     onClick={() => { setIsFolderDropdownOpen(false); handleOpenStudy(study); }}
-                                                    className={`w-full text-left pl-5 pr-3 py-1.5 flex items-center justify-between transition cursor-pointer text-xs ${
-                                                        study.id === activeStudyId
-                                                            ? 'bg-white/10 text-white font-medium border-l border-white/40'
-                                                            : 'text-white/50 hover:bg-white/5 hover:text-white/80'
-                                                    }`}
+                                                    className={`w-full text-left pl-5 pr-3 py-1.5 flex items-center justify-between transition cursor-pointer text-xs ${study.id === activeStudyId
+                                                        ? 'bg-white/10 text-white font-medium border-l border-white/40'
+                                                        : 'text-white/50 hover:bg-white/5 hover:text-white/80'
+                                                        }`}
                                                 >
                                                     <span className="truncate pr-2">{study.name}</span>
                                                     <span className="text-[9px] text-white/25 flex-shrink-0">{study.imageCount} imgs</span>
@@ -1392,11 +1439,10 @@ export default function MedicalViewer() {
                     {patientHierarchy?.studies?.length > 0 && (
                         <button
                             onClick={() => { setIsSidebarOpen((prev) => !prev); setSidebarTab('folders'); }}
-                            className={`flex items-center gap-1 px-2.5 py-1 rounded border font-mono transition flex-shrink-0 ${
-                                isSidebarOpen && sidebarTab === 'folders'
-                                    ? 'bg-white/10 border-white/25 text-white/80'
-                                    : 'border-white/10 text-white/40 hover:border-white/25 hover:text-white/70'
-                            }`}
+                            className={`flex items-center gap-1 px-2.5 py-1 rounded border font-mono transition flex-shrink-0 ${isSidebarOpen && sidebarTab === 'folders'
+                                ? 'bg-white/10 border-white/25 text-white/80'
+                                : 'border-white/10 text-white/40 hover:border-white/25 hover:text-white/70'
+                                }`}
                         >
                             <Folder className="w-3.5 h-3.5" />
                             <span>Folders</span>
@@ -1408,11 +1454,10 @@ export default function MedicalViewer() {
                     <button
                         onClick={handleSendToLocalizer}
                         disabled={!parsedOriginal || isLoadingLocalizer || isLoadingSegment}
-                        className={`flex items-center gap-1.5 px-3 py-1 rounded border font-mono transition flex-shrink-0 ${
-                            !parsedOriginal || isLoadingLocalizer || isLoadingSegment
-                                ? 'border-white/8 text-white/20 cursor-not-allowed'
-                                : 'border-white/20 text-white/60 hover:border-white/40 hover:text-white/90'
-                        }`}
+                        className={`flex items-center gap-1.5 px-3 py-1 rounded border font-mono transition flex-shrink-0 ${!parsedOriginal || isLoadingLocalizer || isLoadingSegment
+                            ? 'border-white/8 text-white/20 cursor-not-allowed'
+                            : 'border-white/20 text-white/60 hover:border-white/40 hover:text-white/90'
+                            }`}
                     >
                         {isLoadingLocalizer ? (
                             <>
@@ -1428,11 +1473,10 @@ export default function MedicalViewer() {
                     <button
                         onClick={handleRunSegmentation}
                         disabled={!parsedOriginal || isLoadingSegment || isLoadingLocalizer}
-                        className={`flex items-center gap-1.5 px-3 py-1 rounded border font-mono transition flex-shrink-0 ${
-                            !parsedOriginal || isLoadingSegment || isLoadingLocalizer
-                                ? 'border-white/8 text-white/20 cursor-not-allowed'
-                                : 'border-cyan-500/40 text-cyan-300/85 hover:border-cyan-400 hover:text-cyan-200 bg-cyan-500/10'
-                        }`}
+                        className={`flex items-center gap-1.5 px-3 py-1 rounded border font-mono transition flex-shrink-0 ${!parsedOriginal || isLoadingSegment || isLoadingLocalizer
+                            ? 'border-white/8 text-white/20 cursor-not-allowed'
+                            : 'border-cyan-500/40 text-cyan-300/85 hover:border-cyan-400 hover:text-cyan-200 bg-cyan-500/10'
+                            }`}
                         title="Preprocess volume and run nnU-Net segmentation"
                     >
                         {isLoadingSegment ? (
@@ -1455,11 +1499,10 @@ export default function MedicalViewer() {
                         id="workstation-assess-viability-btn"
                         onClick={handleAssessViability}
                         disabled={!parsedOriginal}
-                        className={`flex items-center gap-1.5 px-3 py-1 rounded border font-mono transition flex-shrink-0 ${
-                            !parsedOriginal
-                                ? 'border-white/8 text-white/20 cursor-not-allowed'
-                                : 'border-white/20 text-white/60 hover:border-white/40 hover:text-white/90'
-                        }`}
+                        className={`flex items-center gap-1.5 px-3 py-1 rounded border font-mono transition flex-shrink-0 ${!parsedOriginal
+                            ? 'border-white/8 text-white/20 cursor-not-allowed'
+                            : 'border-white/20 text-white/60 hover:border-white/40 hover:text-white/90'
+                            }`}
                     >
                         <span>Assess Viability</span>
                     </button>
@@ -1471,9 +1514,8 @@ export default function MedicalViewer() {
                         <button
                             onClick={() => setIsSplitView(false)}
                             disabled={!parsedOriginal}
-                            className={`flex items-center gap-1 px-2.5 py-1 font-mono transition ${
-                                !isSplitView ? 'bg-white/10 text-white/80' : 'text-white/35 hover:text-white/60'
-                            } ${!parsedOriginal ? 'opacity-30 cursor-not-allowed' : ''}`}
+                            className={`flex items-center gap-1 px-2.5 py-1 font-mono transition ${!isSplitView ? 'bg-white/10 text-white/80' : 'text-white/35 hover:text-white/60'
+                                } ${!parsedOriginal ? 'opacity-30 cursor-not-allowed' : ''}`}
                         >
                             <Square className="w-3.5 h-3.5" />
                             <span>Single</span>
@@ -1481,9 +1523,8 @@ export default function MedicalViewer() {
                         <button
                             onClick={() => setIsSplitView(true)}
                             disabled={!parsedLocalized}
-                            className={`flex items-center gap-1 px-2.5 py-1 font-mono transition border-l border-white/8 ${
-                                isSplitView ? 'bg-white/10 text-white/80' : 'text-white/35 hover:text-white/60'
-                            } ${!parsedLocalized ? 'opacity-30 cursor-not-allowed' : ''}`}
+                            className={`flex items-center gap-1 px-2.5 py-1 font-mono transition border-l border-white/8 ${isSplitView ? 'bg-white/10 text-white/80' : 'text-white/35 hover:text-white/60'
+                                } ${!parsedLocalized ? 'opacity-30 cursor-not-allowed' : ''}`}
                         >
                             <Columns className="w-3.5 h-3.5" />
                             <span>Split 1×2</span>
@@ -1526,9 +1567,8 @@ export default function MedicalViewer() {
                             <div className="flex items-center bg-white/5 rounded border border-cyan-500/30 px-1 gap-1 flex-shrink-0">
                                 <button
                                     onClick={() => setSelectedMaskType((prev) => (prev === 'ai' ? 'none' : 'ai'))}
-                                    className={`flex items-center gap-1 px-2 py-1 rounded font-mono text-xs transition cursor-pointer ${
-                                        selectedMaskType === 'ai' ? 'bg-cyan-500/20 text-cyan-200' : 'text-white/40 hover:text-white/75'
-                                    }`}
+                                    className={`flex items-center gap-1 px-2 py-1 rounded font-mono text-xs transition cursor-pointer ${selectedMaskType === 'ai' ? 'bg-cyan-500/20 text-cyan-200' : 'text-white/40 hover:text-white/75'
+                                        }`}
                                 >
                                     <Layers className="w-3.5 h-3.5" />
                                     <span>{selectedMaskType === 'ai' ? 'AI: ON' : 'AI Mask'}</span>
@@ -1562,9 +1602,8 @@ export default function MedicalViewer() {
                             <div className="flex items-center bg-white/5 rounded border border-white/8 px-1 gap-1 flex-shrink-0">
                                 <button
                                     onClick={() => setSelectedMaskType((prev) => (prev === 'gt' ? 'none' : 'gt'))}
-                                    className={`flex items-center gap-1 px-2 py-1 rounded font-mono text-xs transition cursor-pointer ${
-                                        selectedMaskType === 'gt' ? 'bg-white/10 text-white/80' : 'text-white/35 hover:text-white/60'
-                                    }`}
+                                    className={`flex items-center gap-1 px-2 py-1 rounded font-mono text-xs transition cursor-pointer ${selectedMaskType === 'gt' ? 'bg-white/10 text-white/80' : 'text-white/35 hover:text-white/60'
+                                        }`}
                                 >
                                     <ShieldCheck className="w-3.5 h-3.5" />
                                     <span>{selectedMaskType === 'gt' ? 'GT: ON' : 'GT Mask'}</span>
@@ -1594,13 +1633,13 @@ export default function MedicalViewer() {
                                     onClick={() => {
                                         if (isBrushMode) {
                                             setIsBrushMode(false);
+                                            setBrushHistory([]);
                                         } else {
                                             handleStartBrushMode();
                                         }
                                     }}
-                                    className={`flex items-center gap-1 px-2 py-1 rounded font-mono text-xs transition cursor-pointer ${
-                                        isBrushMode ? 'bg-white/15 text-white/90' : 'text-white/35 hover:text-white/60'
-                                    }`}
+                                    className={`flex items-center gap-1 px-2 py-1 rounded font-mono text-xs transition cursor-pointer ${isBrushMode ? 'bg-white/15 text-white/90' : 'text-white/35 hover:text-white/60'
+                                        }`}
                                     title="Toggle brush mask editor"
                                 >
                                     <span className="font-mono text-[11px]">✎</span>
@@ -1621,11 +1660,10 @@ export default function MedicalViewer() {
                                                     key={lbl.id}
                                                     onClick={() => { setBrushLabel(lbl.id); setBrushTool('draw'); }}
                                                     title={lbl.title}
-                                                    className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono transition cursor-pointer ${
-                                                        brushTool === 'draw' && brushLabel === lbl.id
-                                                            ? 'bg-white/15 text-white'
-                                                            : 'text-white/40 hover:text-white/75'
-                                                    }`}
+                                                    className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono transition cursor-pointer ${brushTool === 'draw' && brushLabel === lbl.id
+                                                        ? 'bg-white/15 text-white'
+                                                        : 'text-white/40 hover:text-white/75'
+                                                        }`}
                                                 >
                                                     <span className={`w-2 h-2 rounded-full ${lbl.dot}`} />
                                                     <span>{lbl.name}</span>
@@ -1637,15 +1675,13 @@ export default function MedicalViewer() {
                                         <div className="flex items-center border-l border-white/8 pl-1 gap-0.5">
                                             <button
                                                 onClick={() => setBrushTool('draw')}
-                                                className={`px-2 py-0.5 rounded text-[10px] font-mono transition cursor-pointer ${
-                                                    brushTool === 'draw' ? 'bg-white/15 text-white/90' : 'text-white/35 hover:text-white/60'
-                                                }`}
+                                                className={`px-2 py-0.5 rounded text-[10px] font-mono transition cursor-pointer ${brushTool === 'draw' ? 'bg-white/15 text-white/90' : 'text-white/35 hover:text-white/60'
+                                                    }`}
                                             >Draw</button>
                                             <button
                                                 onClick={() => setBrushTool('erase')}
-                                                className={`px-2 py-0.5 rounded text-[10px] font-mono transition cursor-pointer ${
-                                                    brushTool === 'erase' ? 'bg-white/15 text-white/90' : 'text-white/35 hover:text-white/60'
-                                                }`}
+                                                className={`px-2 py-0.5 rounded text-[10px] font-mono transition cursor-pointer ${brushTool === 'erase' ? 'bg-white/15 text-white/90' : 'text-white/35 hover:text-white/60'
+                                                    }`}
                                             >Erase</button>
                                         </div>
 
@@ -1685,6 +1721,17 @@ export default function MedicalViewer() {
                                             className="border-l border-white/8 pl-1 px-2 py-0.5 text-[10px] font-mono text-white/30 hover:text-white/60 transition cursor-pointer"
                                             title="Clear this slice"
                                         >Clear</button>
+
+                                        {/* Undo last stroke */}
+                                        <button
+                                            onClick={handleUndo}
+                                            disabled={brushHistory.length === 0}
+                                            className="border-l border-white/8 pl-1 px-1.5 py-0.5 text-[10px] font-mono text-white/40 hover:text-white/80 disabled:opacity-25 transition cursor-pointer flex items-center gap-1"
+                                            title="Undo last stroke (Ctrl+Z)"
+                                        >
+                                            <Undo2 className="w-3 h-3" />
+                                            <span>Undo</span>
+                                        </button>
 
                                         {/* Save mask */}
                                         <button
@@ -1760,9 +1807,8 @@ export default function MedicalViewer() {
                         <button
                             onClick={handleResetRotation}
                             disabled={!parsedOriginal || rotation === 0}
-                            className={`px-1.5 py-1 text-[10px] font-mono border-x border-white/8 transition cursor-pointer ${
-                                rotation !== 0 ? 'text-amber-300 font-bold bg-amber-500/10' : 'text-white/35 hover:text-white/60'
-                            }`}
+                            className={`px-1.5 py-1 text-[10px] font-mono border-x border-white/8 transition cursor-pointer ${rotation !== 0 ? 'text-amber-300 font-bold bg-amber-500/10' : 'text-white/35 hover:text-white/60'
+                                }`}
                             title="Current rotation angle (click to reset to 0°)"
                         >
                             {rotation}°
@@ -1820,33 +1866,30 @@ export default function MedicalViewer() {
                                 {patientHierarchy?.studies?.length > 0 && (
                                     <button
                                         onClick={() => setSidebarTab('folders')}
-                                        className={`px-2.5 py-1 rounded transition ${
-                                            sidebarTab === 'folders'
-                                                ? 'bg-white/10 text-white'
-                                                : 'text-white/40 hover:text-white/70'
-                                        }`}
+                                        className={`px-2.5 py-1 rounded transition ${sidebarTab === 'folders'
+                                            ? 'bg-white/10 text-white'
+                                            : 'text-white/40 hover:text-white/70'
+                                            }`}
                                     >
                                         Folders ({patientHierarchy.studies.length})
                                     </button>
                                 )}
                                 <button
                                     onClick={() => setSidebarTab('clinical')}
-                                    className={`px-2.5 py-1 rounded transition ${
-                                        sidebarTab === 'clinical'
-                                            ? 'bg-white/10 text-white'
-                                            : 'text-white/40 hover:text-white/70'
-                                    }`}
+                                    className={`px-2.5 py-1 rounded transition ${sidebarTab === 'clinical'
+                                        ? 'bg-white/10 text-white'
+                                        : 'text-white/40 hover:text-white/70'
+                                        }`}
                                 >
                                     Profile
                                 </button>
                                 {parsedOriginal && (
                                     <button
                                         onClick={() => setSidebarTab('metadata')}
-                                        className={`px-2.5 py-1 rounded transition ${
-                                            sidebarTab === 'metadata'
-                                                ? 'bg-white/10 text-white'
-                                                : 'text-white/40 hover:text-white/70'
-                                        }`}
+                                        className={`px-2.5 py-1 rounded transition ${sidebarTab === 'metadata'
+                                            ? 'bg-white/10 text-white'
+                                            : 'text-white/40 hover:text-white/70'
+                                            }`}
                                     >
                                         Tags
                                     </button>
@@ -2294,11 +2337,10 @@ export default function MedicalViewer() {
                         <div className="flex items-center gap-1.5 flex-shrink-0">
                             <button
                                 onClick={() => setIsPlayingCine(!isPlayingCine)}
-                                className={`p-1 rounded transition cursor-pointer ${
-                                    isPlayingCine
-                                        ? 'bg-white/10 text-white'
-                                        : 'text-white/40 hover:text-white/70'
-                                }`}
+                                className={`p-1 rounded transition cursor-pointer ${isPlayingCine
+                                    ? 'bg-white/10 text-white'
+                                    : 'text-white/40 hover:text-white/70'
+                                    }`}
                                 title={isPlayingCine ? 'Pause' : 'Play'}
                             >
                                 {isPlayingCine ? <Pause className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}
@@ -2496,19 +2538,19 @@ export default function MedicalViewer() {
                 activeScanInfo={
                     parsedOriginal
                         ? {
-                              fileName: currentSeriesObj?.filename || rawFile?.name || 'Cardiac Scan',
-                              type: parsedOriginal.type,
-                              currentSlice,
-                              totalSlices: parsedOriginal.numSlices,
-                              rows: parsedOriginal.rows,
-                              cols: parsedOriginal.cols,
-                              sequenceType: currentSeriesObj?.sequenceType || currentSeriesObj?.name || 'Cardiac MRI',
-                              patientName: patientStudyName || 'Patient Study',
-                              hasAiMask: Boolean(currentSeriesObj?.aiMask),
-                              hasGtMask: Boolean(activeGtMask || currentSeriesObj?.hasGtMask),
-                              clinicalData: clinicalData || null,
-                              metadata: parsedOriginal.metadata || null
-                          }
+                            fileName: currentSeriesObj?.filename || rawFile?.name || 'Cardiac Scan',
+                            type: parsedOriginal.type,
+                            currentSlice,
+                            totalSlices: parsedOriginal.numSlices,
+                            rows: parsedOriginal.rows,
+                            cols: parsedOriginal.cols,
+                            sequenceType: currentSeriesObj?.sequenceType || currentSeriesObj?.name || 'Cardiac MRI',
+                            patientName: patientStudyName || 'Patient Study',
+                            hasAiMask: Boolean(currentSeriesObj?.aiMask),
+                            hasGtMask: Boolean(activeGtMask || currentSeriesObj?.hasGtMask),
+                            clinicalData: clinicalData || null,
+                            metadata: parsedOriginal.metadata || null
+                        }
                         : null
                 }
                 isLocalized={Boolean(parsedLocalized)}

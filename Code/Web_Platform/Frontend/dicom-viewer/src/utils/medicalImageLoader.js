@@ -629,16 +629,15 @@ export function renderSliceToCanvas(
     const upper = wc + ww / 2;
     const range = upper - lower || 1;
 
-    // Palette: [R, G, B]
-    const getMaskRgb = (val, palette) => {
-        const isGt = palette === 'groundTruth';
+    // Palette: [R, G, B] — Unified EMIDEC cardiac segmentation colors
+    const getMaskRgb = (val) => {
         const label = Math.round(val);
         // Cardiac anatomical labels: 1 = Cavity, 2 = Myocardium, 3 = Infarction, 4 = No-Reflow
-        if (label === 1) return isGt ? [16, 185, 129] : [6, 182, 212];    // Emerald (GT) vs Cyan (AI)
-        if (label === 2) return isGt ? [239, 68, 68] : [168, 85, 247];    // Red (GT) vs Purple (AI)
-        if (label === 3) return isGt ? [245, 158, 11] : [245, 158, 11];   // Amber (GT) & Amber (AI)
-        if (label === 4) return isGt ? [236, 72, 153] : [244, 63, 94];    // Pink (GT) vs Rose (AI)
-        if (label > 0) return isGt ? [16, 185, 129] : [6, 182, 212];      // Any other label
+        if (label === 1) return [6, 182, 212];     // Cyan (Cavity)
+        if (label === 2) return [168, 85, 247];    // Purple (Myocardium)
+        if (label === 3) return [245, 158, 11];    // Amber (Infarction)
+        if (label === 4) return [244, 63, 94];     // Rose (No-Reflow)
+        if (label > 0) return [6, 182, 212];       // Any other label
         return null;
     };
 
