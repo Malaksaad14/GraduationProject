@@ -4,6 +4,8 @@ import {
     Columns,
     Square,
     RotateCcw,
+    RotateCw,
+    Maximize2,
     Sun,
     Move,
     ZoomIn,
@@ -33,6 +35,7 @@ import {
     buildHierarchicalStudyTree,
     assembleSingleStudy
 } from '../utils/medicalImageLoader';
+import { getAnatomicalOrientation, getCanvasImageCoords } from '../utils/orientationHelper';
 import AIChatbot from './AIChatbot';
 import ClinicalDataPanel from './ClinicalDataPanel';
 import SeriesBrowser from './SeriesBrowser';
@@ -231,6 +234,7 @@ export default function MedicalViewer() {
     const [windowWidth, setWindowWidth] = useState(0);
     const [zoom, setZoom] = useState(1);
     const [pan, setPan] = useState({ x: 0, y: 0 });
+    const [rotation, setRotation] = useState(0); // 0, 90, 180, 270
     const [isDraggingPan, setIsDraggingPan] = useState(false);
     const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
     const [activeTool, setActiveTool] = useState('pan'); // 'pan' | 'window' | 'zoom'
@@ -460,6 +464,7 @@ export default function MedicalViewer() {
         const fit = getFitZoom(series.parsed, Boolean(series.localizedResult));
         setZoom(fit);
         setPan({ x: 0, y: 0 });
+        setRotation(0);
         setIsPlayingCine(false);
         setIsBrushMode(false);
         setBrushMaskData(null);
@@ -962,9 +967,11 @@ export default function MedicalViewer() {
     const handleMouseMove = (e) => {
         if (!parsedOriginal) return;
 
-        // Update Mouse Position & hovered segmentation region info
-        const rect = origCanvasRef.current?.getBoundingClientRect();
-        const locRect = isSplitView ? locCanvasRef.current?.getBoundingClientRect() : null;
+        // Update Mouse Position & hovered segmentation region info (accounting for rotation)
+        const origCoords = getCanvasImageCoords(e.clientX, e.clientY, origCanvasRef.current, activeSliceCols, activeSliceRows, rotation);
+        const locCoords = (isSplitView && parsedLocalized)
+            ? getCanvasImageCoords(e.clientX, e.clientY, locCanvasRef.current, parsedLocalized.cols, parsedLocalized.rows, rotation)
+            : null;
         let hoveredRegion = null;
 
         const readHoveredLabel = (x, y, cols, rows, sliceArr) => {
@@ -974,9 +981,9 @@ export default function MedicalViewer() {
             return SEGMENTATION_REGIONS.find((r) => r.id === lbl)?.name || `Label ${lbl}`;
         };
 
-        if (rect && e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
-            const mouseX = Math.floor(((e.clientX - rect.left) / rect.width) * activeSliceCols);
-            const mouseY = Math.floor(((e.clientY - rect.top) / rect.height) * activeSliceRows);
+        if (origCoords) {
+            const mouseX = origCoords.px;
+            const mouseY = origCoords.py;
             if (isBrushMode && brushMaskData?.get(currentSlice)) {
                 hoveredRegion = readHoveredLabel(mouseX, mouseY, activeSliceCols, activeSliceRows, brushMaskData.get(currentSlice));
             } else if (selectedMaskType === 'ai' && activeAiMask?.parsed) {
@@ -987,9 +994,9 @@ export default function MedicalViewer() {
                 hoveredRegion = readHoveredLabel(mouseX, mouseY, activeSliceCols, activeSliceRows, activeGtMask.parsed.getSliceData(mSlice, 0));
             }
             setMousePos({ x: mouseX, y: mouseY, value: 'Active', region: hoveredRegion });
-        } else if (locRect && parsedLocalized && e.clientX >= locRect.left && e.clientX <= locRect.right && e.clientY >= locRect.top && e.clientY <= locRect.bottom) {
-            const mouseX = Math.floor(((e.clientX - locRect.left) / locRect.width) * parsedLocalized.cols);
-            const mouseY = Math.floor(((e.clientY - locRect.top) / locRect.height) * parsedLocalized.rows);
+        } else if (locCoords && parsedLocalized) {
+            const mouseX = locCoords.px;
+            const mouseY = locCoords.py;
             if (selectedMaskType === 'ai' && activeAiMask?.roiParsed) {
                 const roiSlice = Math.min(currentSlice, (activeAiMask.roiParsed.numSlices || 1) - 1);
                 hoveredRegion = readHoveredLabel(mouseX, mouseY, parsedLocalized.cols, parsedLocalized.rows, activeAiMask.roiParsed.getSliceData(roiSlice, 0));
@@ -1096,16 +1103,12 @@ export default function MedicalViewer() {
         });
     }, [parsedOriginal, selectedMaskType, activeGtMask, activeAiMask]);
 
-    // ── Brush: convert display coords → image pixel coords ───────────────────
+    // ── Brush: convert display coords → image pixel coords (with rotation) ───
     const displayToImageCoords = useCallback((clientX, clientY) => {
         const imgCanvas = origCanvasRef.current;
         if (!imgCanvas || !parsedOriginal) return null;
-        const rect = imgCanvas.getBoundingClientRect();
-        // getBoundingClientRect gives the displayed (scaled) canvas position
-        const px = Math.round(((clientX - rect.left) / rect.width) * activeSliceCols);
-        const py = Math.round(((clientY - rect.top) / rect.height) * activeSliceRows);
-        return { px, py };
-    }, [parsedOriginal, activeSliceCols, activeSliceRows]);
+        return getCanvasImageCoords(clientX, clientY, imgCanvas, activeSliceCols, activeSliceRows, rotation);
+    }, [parsedOriginal, activeSliceCols, activeSliceRows, rotation]);
 
     // ── Brush: paint circle in mask at image coords ───────────────────────────
     const paintBrush = useCallback((clientX, clientY) => {
@@ -1223,9 +1226,45 @@ export default function MedicalViewer() {
         if (!parsedOriginal) return;
         setZoom(getFitZoom(parsedOriginal, isSplitView));
         setPan({ x: 0, y: 0 });
+        setRotation(0);
         setWindowCenter(parsedOriginal.defaultWindowCenter);
         setWindowWidth(parsedOriginal.defaultWindowWidth);
     };
+
+    // ── Rotation Handlers ──────────────────────────────────────────────────────
+    const handleRotateCw = useCallback(() => {
+        setRotation((prev) => (prev + 90) % 360);
+    }, []);
+
+    const handleRotateCcw = useCallback(() => {
+        setRotation((prev) => ((prev - 90) % 360 + 360) % 360);
+    }, []);
+
+    const handleResetRotation = useCallback(() => {
+        setRotation(0);
+    }, []);
+
+    // ── Anatomical Patient Orientation (Dynamically updates with rotation) ───
+    const orientation = useMemo(() => {
+        return getAnatomicalOrientation(parsedOriginal, currentSlice, currentTimeFrame, rotation);
+    }, [parsedOriginal, currentSlice, currentTimeFrame, rotation]);
+
+    // ── Keyboard Shortcut: 'r' / 'Shift+r' to rotate ──────────────────────────
+    useEffect(() => {
+        const handleKeyDown = (e) => {
+            if (['INPUT', 'TEXTAREA'].includes(e.target?.tagName)) return;
+            if (e.key === 'r' || e.key === 'R') {
+                e.preventDefault();
+                if (e.shiftKey) {
+                    handleRotateCcw();
+                } else {
+                    handleRotateCw();
+                }
+            }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [handleRotateCw, handleRotateCcw]);
 
     return (
         <div className="flex flex-col h-screen bg-[#070b12] text-slate-100 font-sans select-none overflow-hidden">
@@ -1696,18 +1735,60 @@ export default function MedicalViewer() {
 
                     <div className="h-5 w-px bg-white/8 flex-shrink-0" />
 
-                    {/* Zoom In/Out/Reset */}
+                    {/* Zoom In/Out */}
                     <div className="flex items-center gap-0.5">
-                        <button onClick={handleZoomIn} disabled={!parsedOriginal} className="p-1.5 rounded hover:bg-white/5 text-white/35 hover:text-white/70 disabled:opacity-20 transition" title="Zoom in">
+                        <button onClick={handleZoomIn} disabled={!parsedOriginal} className="p-1.5 rounded hover:bg-white/5 text-white/35 hover:text-white/70 disabled:opacity-20 transition cursor-pointer" title="Zoom in">
                             <ZoomIn className="w-3.5 h-3.5" />
                         </button>
-                        <button onClick={handleZoomOut} disabled={!parsedOriginal} className="p-1.5 rounded hover:bg-white/5 text-white/35 hover:text-white/70 disabled:opacity-20 transition" title="Zoom out">
+                        <button onClick={handleZoomOut} disabled={!parsedOriginal} className="p-1.5 rounded hover:bg-white/5 text-white/35 hover:text-white/70 disabled:opacity-20 transition cursor-pointer" title="Zoom out">
                             <ZoomOut className="w-3.5 h-3.5" />
                         </button>
-                        <button onClick={handleResetView} disabled={!parsedOriginal} className="p-1.5 rounded hover:bg-white/5 text-white/35 hover:text-white/70 disabled:opacity-20 transition" title="Reset">
+                    </div>
+
+                    <div className="h-5 w-px bg-white/8 flex-shrink-0" />
+
+                    {/* Rotation: CCW / Angle / CW */}
+                    <div className="flex items-center bg-white/5 rounded border border-white/8 overflow-hidden">
+                        <button
+                            onClick={handleRotateCcw}
+                            disabled={!parsedOriginal}
+                            className="p-1.5 transition cursor-pointer text-white/40 hover:text-white/80 hover:bg-white/5 disabled:opacity-20"
+                            title="Rotate 90° CCW (Shift+R)"
+                        >
                             <RotateCcw className="w-3.5 h-3.5" />
                         </button>
+                        <button
+                            onClick={handleResetRotation}
+                            disabled={!parsedOriginal || rotation === 0}
+                            className={`px-1.5 py-1 text-[10px] font-mono border-x border-white/8 transition cursor-pointer ${
+                                rotation !== 0 ? 'text-amber-300 font-bold bg-amber-500/10' : 'text-white/35 hover:text-white/60'
+                            }`}
+                            title="Current rotation angle (click to reset to 0°)"
+                        >
+                            {rotation}°
+                        </button>
+                        <button
+                            onClick={handleRotateCw}
+                            disabled={!parsedOriginal}
+                            className="p-1.5 transition cursor-pointer text-white/40 hover:text-white/80 hover:bg-white/5 disabled:opacity-20"
+                            title="Rotate 90° CW (R)"
+                        >
+                            <RotateCw className="w-3.5 h-3.5" />
+                        </button>
                     </div>
+
+                    <div className="h-5 w-px bg-white/8 flex-shrink-0" />
+
+                    {/* Reset View */}
+                    <button
+                        onClick={handleResetView}
+                        disabled={!parsedOriginal}
+                        className="flex items-center gap-1 px-2 py-1 rounded hover:bg-white/5 text-white/35 hover:text-white/70 disabled:opacity-20 transition text-xs font-mono cursor-pointer"
+                        title="Reset View (Zoom, Pan, Window, Rotation)"
+                    >
+                        <Maximize2 className="w-3.5 h-3.5" />
+                        <span className="text-[10px]">Reset</span>
+                    </button>
                 </div>
             </div>
 
@@ -1934,6 +2015,9 @@ export default function MedicalViewer() {
                             {/* Viewport Overlay — Top Left */}
                             <div className="absolute top-2 left-2 z-10 flex items-center gap-1.5 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/50">
                                 <span>{parsedOriginal.type.toUpperCase()}</span>
+                                <span className="text-amber-300/85 border border-amber-500/25 px-1 rounded font-medium" title={orientation.angleDesc}>
+                                    {orientation.plane}
+                                </span>
                                 {selectedMaskType === 'gt' && (
                                     <span className="text-white/60 border border-white/15 px-1 rounded">GT</span>
                                 )}
@@ -1965,6 +2049,44 @@ export default function MedicalViewer() {
                                 )}
                             </div>
 
+                            {/* Anatomical Orientation Markers (A / P / L / R / S / I) */}
+                            {parsedOriginal && (
+                                <>
+                                    <div className="absolute top-2.5 left-1/2 -translate-x-1/2 z-20 pointer-events-none select-none">
+                                        <span
+                                            className="font-mono text-[11px] font-bold text-amber-300/90 bg-[#0d1b2a]/90 border border-amber-500/30 px-2 py-0.5 rounded shadow-lg backdrop-blur-xs tracking-wider"
+                                            title={`Top: ${orientation.fullLabels.top}`}
+                                        >
+                                            {orientation.top}
+                                        </span>
+                                    </div>
+                                    <div className="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-20 pointer-events-none select-none">
+                                        <span
+                                            className="font-mono text-[11px] font-bold text-amber-300/90 bg-[#0d1b2a]/90 border border-amber-500/30 px-2 py-0.5 rounded shadow-lg backdrop-blur-xs tracking-wider"
+                                            title={`Bottom: ${orientation.fullLabels.bottom}`}
+                                        >
+                                            {orientation.bottom}
+                                        </span>
+                                    </div>
+                                    <div className="absolute left-2.5 top-1/2 -translate-y-1/2 z-20 pointer-events-none select-none">
+                                        <span
+                                            className="font-mono text-[11px] font-bold text-amber-300/90 bg-[#0d1b2a]/90 border border-amber-500/30 px-1.5 py-1 rounded shadow-lg backdrop-blur-xs tracking-wider"
+                                            title={`Left: ${orientation.fullLabels.left}`}
+                                        >
+                                            {orientation.left}
+                                        </span>
+                                    </div>
+                                    <div className="absolute right-2.5 top-1/2 -translate-y-1/2 z-20 pointer-events-none select-none">
+                                        <span
+                                            className="font-mono text-[11px] font-bold text-amber-300/90 bg-[#0d1b2a]/90 border border-amber-500/30 px-1.5 py-1 rounded shadow-lg backdrop-blur-xs tracking-wider"
+                                            title={`Right: ${orientation.fullLabels.right}`}
+                                        >
+                                            {orientation.right}
+                                        </span>
+                                    </div>
+                                </>
+                            )}
+
                             {/* Canvas Wrapper */}
                             <div className="flex-1 flex items-center justify-center overflow-hidden bg-black relative">
                                 <div
@@ -1973,7 +2095,7 @@ export default function MedicalViewer() {
                                         display: 'inline-flex',
                                         alignItems: 'center',
                                         justifyContent: 'center',
-                                        transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                                        transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${rotation}deg)`,
                                         transformOrigin: 'center center',
                                         transition: isDraggingPan ? 'none' : 'transform 0.1s ease-out'
                                     }}
@@ -2006,6 +2128,7 @@ export default function MedicalViewer() {
                                 <span>W: {Math.round(windowWidth)}</span>
                                 <span>L: {Math.round(windowCenter)}</span>
                                 <span>{zoom.toFixed(2)}x</span>
+                                <span className={rotation !== 0 ? 'text-amber-300 font-semibold' : ''}>Rot: {rotation}°</span>
                                 <span>{mousePos.x},{mousePos.y}</span>
                                 {mousePos.region && (
                                     <span className="text-cyan-300 border-l border-white/10 pl-2 font-semibold">
@@ -2052,6 +2175,9 @@ export default function MedicalViewer() {
                                 {/* Viewport 2 — Top Left */}
                                 <div className="absolute top-2 left-2 z-10 flex items-center gap-1.5 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/50">
                                     <span>LOCALIZED LV</span>
+                                    <span className="text-amber-300/85 border border-amber-500/25 px-1 rounded font-medium">
+                                        {orientation.plane}
+                                    </span>
                                     <span className="border border-white/10 px-1 rounded text-white/35">MODEL</span>
                                 </div>
 
@@ -2063,7 +2189,43 @@ export default function MedicalViewer() {
                                     </div>
                                 )}
 
-
+                                {/* Viewport 2 Anatomical Orientation Markers */}
+                                {parsedLocalized && (
+                                    <>
+                                        <div className="absolute top-2.5 left-1/2 -translate-x-1/2 z-20 pointer-events-none select-none">
+                                            <span
+                                                className="font-mono text-[11px] font-bold text-amber-300/90 bg-[#0d1b2a]/90 border border-amber-500/30 px-2 py-0.5 rounded shadow-lg backdrop-blur-xs tracking-wider"
+                                                title={`Top: ${orientation.fullLabels.top}`}
+                                            >
+                                                {orientation.top}
+                                            </span>
+                                        </div>
+                                        <div className="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-20 pointer-events-none select-none">
+                                            <span
+                                                className="font-mono text-[11px] font-bold text-amber-300/90 bg-[#0d1b2a]/90 border border-amber-500/30 px-2 py-0.5 rounded shadow-lg backdrop-blur-xs tracking-wider"
+                                                title={`Bottom: ${orientation.fullLabels.bottom}`}
+                                            >
+                                                {orientation.bottom}
+                                            </span>
+                                        </div>
+                                        <div className="absolute left-2.5 top-1/2 -translate-y-1/2 z-20 pointer-events-none select-none">
+                                            <span
+                                                className="font-mono text-[11px] font-bold text-amber-300/90 bg-[#0d1b2a]/90 border border-amber-500/30 px-1.5 py-1 rounded shadow-lg backdrop-blur-xs tracking-wider"
+                                                title={`Left: ${orientation.fullLabels.left}`}
+                                            >
+                                                {orientation.left}
+                                            </span>
+                                        </div>
+                                        <div className="absolute right-2.5 top-1/2 -translate-y-1/2 z-20 pointer-events-none select-none">
+                                            <span
+                                                className="font-mono text-[11px] font-bold text-amber-300/90 bg-[#0d1b2a]/90 border border-amber-500/30 px-1.5 py-1 rounded shadow-lg backdrop-blur-xs tracking-wider"
+                                                title={`Right: ${orientation.fullLabels.right}`}
+                                            >
+                                                {orientation.right}
+                                            </span>
+                                        </div>
+                                    </>
+                                )}
 
                                 {/* Canvas Wrapper */}
                                 <div className="flex-1 flex items-center justify-center overflow-hidden bg-black relative">
@@ -2071,7 +2233,7 @@ export default function MedicalViewer() {
                                         <canvas
                                             ref={locCanvasRef}
                                             style={{
-                                                transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                                                transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${rotation}deg)`,
                                                 imageRendering: 'pixelated',
                                                 transition: isDraggingPan ? 'none' : 'transform 0.1s ease-out'
                                             }}
@@ -2088,6 +2250,7 @@ export default function MedicalViewer() {
                                 {/* Viewport 2 — Bottom Left */}
                                 <div className="absolute bottom-2 left-2 z-10 bg-[#0d1b2a]/80 px-2 py-1 rounded text-[10px] font-mono text-white/35 flex items-center gap-2">
                                     <span>Synchronized · LV ROI</span>
+                                    <span className={rotation !== 0 ? 'text-amber-300 font-semibold' : ''}>· {rotation}°</span>
                                     {mousePos.region && (
                                         <span className="text-cyan-300 border-l border-white/10 pl-2 font-semibold">
                                             {mousePos.region}
@@ -2307,6 +2470,10 @@ export default function MedicalViewer() {
                             <div className="flex justify-between bg-slate-900/80 px-3 py-2 rounded-lg border border-slate-800">
                                 <span>Brightness / Contrast:</span>
                                 <span className="text-white/60">Window Tool & Drag</span>
+                            </div>
+                            <div className="flex justify-between bg-slate-900/80 px-3 py-2 rounded-lg border border-slate-800">
+                                <span>Rotate 90°:</span>
+                                <span className="text-white/60">R (CW) / Shift + R (CCW)</span>
                             </div>
                             <div className="flex justify-between bg-slate-900/80 px-3 py-2 rounded-lg border border-slate-800">
                                 <span>Next / Prev Slice:</span>

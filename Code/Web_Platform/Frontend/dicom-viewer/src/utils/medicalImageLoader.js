@@ -103,6 +103,7 @@ export async function parseMedicalFile(arrayBuffer, filename) {
             max,
             wc: min + (max - min) / 2,
             ww: max - min || 1,
+            affine: header.affine,
         });
 
         return {
@@ -115,6 +116,7 @@ export async function parseMedicalFile(arrayBuffer, filename) {
             isCine,
             min,
             max,
+            affine: header.affine,
             defaultWindowCenter: min + (max - min) / 2,
             defaultWindowWidth: max - min || 1,
             getSliceData,
@@ -389,7 +391,16 @@ export function assembleDicomSeries(items, seriesName) {
         const z = Math.max(0, Math.min(sliceIndex, numSlices - 1));
         const group = spatialGroups[z];
         if (!group || group.items.length === 0) {
-            return { cols, rows, min, max, wc: first.wc, ww: first.ww };
+            return {
+                cols,
+                rows,
+                min,
+                max,
+                wc: first.wc,
+                ww: first.ww,
+                imageOrientationPatient: first.imageOrientationPatient,
+                imagePositionPatient: first.imagePositionPatient,
+            };
         }
         const t = Math.max(0, Math.min(timeFrameIndex, group.items.length - 1));
         const item = group.items[t];
@@ -400,6 +411,8 @@ export function assembleDicomSeries(items, seriesName) {
             max: item.max ?? max,
             wc: item.wc ?? first.wc,
             ww: item.ww ?? first.ww,
+            imageOrientationPatient: item.imageOrientationPatient || first.imageOrientationPatient,
+            imagePositionPatient: item.imagePositionPatient || first.imagePositionPatient,
         };
     };
 
@@ -440,6 +453,8 @@ export function assembleDicomSeries(items, seriesName) {
         dimensionType,
         min,
         max,
+        imageOrientationPatient: first.imageOrientationPatient,
+        imagePositionPatient: first.imagePositionPatient,
         defaultWindowCenter: first.wc,
         defaultWindowWidth: first.ww,
         getSliceData,
